@@ -9,6 +9,7 @@ import logging
 import threading
 from typing import List, Optional
 import subprocess
+import shlex
 
 # validator is invoked via subprocess to avoid cross-thread/process sharing
 
@@ -71,14 +72,24 @@ def run_scraper_in_subprocess(output_dir: str) -> Optional[dict]:
         "--log-level", "WARNING",
     ]
     try:
+        logger.info("scraper: starting cmd=%s", " ".join(shlex.quote(x) for x in cmd))
+        t0 = time.perf_counter()
         proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        out = proc.stdout.strip()
+        dt = time.perf_counter() - t0
+        out = (proc.stdout or "").strip()
+        err = (proc.stderr or "").strip()
+        logger.info(
+            "scraper: completed rc=%d in %.2fs (stdout=%dB stderr=%dB)",
+            getattr(proc, "returncode", 0), dt, len(proc.stdout or ""), len(proc.stderr or "")
+        )
+        if err:
+            logger.debug("scraper stderr: %s", err[-500:])
         if out:
             last = out.splitlines()[-1]
             try:
                 return json.loads(last)
             except Exception:
-                logger.debug("scraper stdout tail (non-JSON): %s", last)
+                logger.debug("scraper stdout tail (non-JSON): %s", last[:500])
         return None
     except subprocess.CalledProcessError as e:
         logger.error("Scraper subprocess failed: rc=%s stderr=%s", e.returncode, e.stderr)
@@ -100,8 +111,23 @@ def run_validator_in_subprocess(input_path: str, out_temp_path: str, url: str, w
         "--output", out_temp_path,
     ]
     try:
-        subprocess.run(cmd, capture_output=True, text=True, check=True)
-        return os.path.isfile(out_temp_path)
+        try:
+            in_size = os.path.getsize(input_path)
+        except OSError:
+            in_size = -1
+        logger.info(
+            "validator: starting cmd=%s (input=%s size=%dB workers=%d url=%s)",
+            " ".join(shlex.quote(x) for x in cmd), input_path, in_size, max(1, workers), url
+        )
+        t0 = time.perf_counter()
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        dt = time.perf_counter() - t0
+        out_ok = os.path.isfile(out_temp_path)
+        err = (proc.stderr or "").strip()
+        logger.info("validator: completed rc=%d in %.2fs produced=%s", getattr(proc, "returncode", 0), dt, "yes" if out_ok else "no")
+        if err:
+            logger.debug("validator stderr: %s", err[-500:])
+        return out_ok
     except subprocess.CalledProcessError as e:
         logger.error("Validator subprocess failed: rc=%s stderr=%s", e.returncode, e.stderr)
         return False
@@ -135,9 +161,18 @@ def produce_loop(stop: threading.Event) -> None:
         else:
             workers = max(1, min(VALIDATOR_WORKERS, len(candidates)))
             logger.info("validate: start total=%d workers=%d url='%s' timeout=%.1f", len(candidates), workers, VALIDATION_URL, VALIDATOR_TIMEOUT)
+            # Debug sample of candidates
+            if logger.isEnabledFor(logging.DEBUG):
+                sample = ", ".join(candidates[:3])
+                logger.debug("produce: sample candidates: %s%s", sample, " ..." if len(candidates) > 3 else "")
             try:
                 # Write combined input for validator (preserve per-protocol scheme)
                 atomic_write(combined_input, "\n".join(candidates) + "\n")
+                try:
+                    size = os.path.getsize(combined_input)
+                except OSError:
+                    size = -1
+                logger.info("validate: wrote combined input '%s' (%d bytes)", combined_input, size)
                 ok = run_validator_in_subprocess(combined_input, tmp_output, VALIDATION_URL, workers, VALIDATOR_TIMEOUT)
                 if ok:
                     try:
@@ -145,11 +180,15 @@ def produce_loop(stop: threading.Event) -> None:
                             data = f.read()
                         atomic_write(final_output, data)
                         live_count = sum(1 for _ in data.splitlines() if _.strip())
-                        logger.info("produce: published live=%d proxies", live_count)
+                        try:
+                            fsize = os.path.getsize(final_output)
+                        except OSError:
+                            fsize = -1
+                        logger.info("produce: published file='%s' size=%dB live=%d", final_output, fsize, live_count)
                     except Exception as e:
                         logger.exception("produce: failed publishing: %s", e)
                 else:
-                    logger.warning("produce: validator did not produce output")
+                    logger.warning("produce: validator did not produce output; expected '%s'", tmp_output)
             except Exception as e:
                 logger.exception("produce: validator step failed: %s", e)
 
@@ -185,15 +224,49 @@ def proxy_server_loop(stop: threading.Event) -> None:
     try:
         while not stop.is_set():
             try:
+                # Decide whether to capture proxy.py subprocess output
+                capture = os.environ.get("PROXXY_PROXY_CAPTURE_OUTPUT", "1").lower() not in ("0", "false", "no")
+                stdout_target = subprocess.PIPE if capture else subprocess.DEVNULL
+                stderr_target = subprocess.PIPE if capture else subprocess.DEVNULL
+                text_mode = True if capture else False
+                encoding = "utf-8" if capture else None
+                errors = "replace" if capture else None
+                bufsize = 1 if capture else 0
+
+                logger.info("proxy: starting cmd=%s", " ".join(shlex.quote(x) for x in cmd))
                 proc = subprocess.Popen(
                     cmd,
                     env=env,
                     stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    text=False,
+                    stdout=stdout_target,
+                    stderr=stderr_target,
+                    text=text_mode,
+                    encoding=encoding,
+                    errors=errors,
+                    bufsize=bufsize,
                 )
                 logger.info("proxy: listening on %s:%d (pid=%s)", host, port, getattr(proc, "pid", "?"))
+
+                # If capturing, stream subprocess output into our logger
+                reader_threads = []
+                if capture:
+                    def _reader(stream, name, level):
+                        try:
+                            for line in iter(stream.readline, ""):
+                                if not line:
+                                    break
+                                logger.log(level, "proxy-subproc %s: %s", name, line.rstrip())
+                        except Exception:
+                            pass
+                    if proc.stdout:
+                        t_out = threading.Thread(target=_reader, args=(proc.stdout, "stdout", logging.INFO), name="proxy-stdout", daemon=True)
+                        t_out.start()
+                        reader_threads.append(t_out)
+                    if proc.stderr:
+                        t_err = threading.Thread(target=_reader, args=(proc.stderr, "stderr", logging.WARNING), name="proxy-stderr", daemon=True)
+                        t_err.start()
+                        reader_threads.append(t_err)
+
                 while not stop.is_set():
                     ret = proc.poll()
                     if ret is not None:
