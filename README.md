@@ -33,27 +33,23 @@ git clone https://github.com/0xSolanaceae/proXXy.git
 cd proXXy
 ```
 
-- Install dependencies with `poetry`:
+- Install dependencies with uv (creates a virtual environment and uv.lock):
 
 ```bash
-poetry install
+uv sync
 ```
 
-If you don't have `poetry` installed, install it [here](https://python-poetry.org/docs/#installation).
+If you don't have uv installed, see install instructions at https://docs.astral.sh/uv/getting-started/installation/
 
 ## Usage
 
-- Activate the poetry shell:
+- Run with uv (no need to activate a virtualenv manually):
 
 ```bash
-poetry shell
+uv run python src/proXXy.py
 ```
 
-- Running the program without flags results in only scraping, as checking is disabled by default:
-
-```bash
-python3 proXXy.py
-```
+- Running the program without flags results in only scraping, as checking is disabled by default.
 
 The program will modify four files in the `output/` directory with your proxies:
 
@@ -69,7 +65,7 @@ The program will modify four files in the `output/` directory with your proxies:
 Syntax for running proXXy is as follows:
 
 ```bash
-usage: proXXy.py [-h] [--validate] [--update] [--version] [--src_check]
+uv run python src/proXXy.py [-h] [--validate] [--update] [--version]
 ```
 
 1. `-V, --validate`: This flag enables proxy validation. The scraper will look to validate the scraped proxies by checking their accessibility.
@@ -80,10 +76,8 @@ usage: proXXy.py [-h] [--validate] [--update] [--version] [--src_check]
 
 4. `-v, --version`: Use this flag to spit out `proXXy.py`'s version.
 
-5. `-s, --src_check`: Use this flag to categorize the sources according to how many proxies they provide.
-
 ```bash
-usage: proXXy.py [-h] [--validate] [--update] [--version] [--src_check]
+usage: proXXy.py [-h] [--validate] [--update] [--version]
 
 A super simple asynchronous multithreaded proxy scraper;
 scraping & checking ~500k HTTP, HTTPS, SOCKS4, & SOCKS5 proxies.
@@ -93,7 +87,6 @@ options:
   --validate, -v  Flag to validate proxies after scraping (default: False)
   --update, -u    Flag to run the update script and then exit
   --version, -V   Print the version of the script and exit
-  --src_check, -s Flag to verify sources
 ```
 
 ## Planned Features
