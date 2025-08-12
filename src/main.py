@@ -5,6 +5,7 @@ import sys
 import time
 import signal
 import logging
+import argparse
 import threading
 from typing import List, Optional
 import subprocess
@@ -24,7 +25,6 @@ if not logger.handlers:
 @dataclass(frozen=True)
 class OrchestratorConfig:
     output_dir: str
-    scrape_interval: int
     validation_url: str
     validator_workers: int
     validator_timeout: float
@@ -37,7 +37,6 @@ class OrchestratorConfig:
 
 def load_config_from_env() -> OrchestratorConfig:
     output_dir = os.environ.get("PROXXY_OUTPUT_DIR", "output")
-    scrape_interval = int(os.environ.get("PROXXY_SCRAPE_INTERVAL_SECONDS", "1800"))
     validation_url = os.environ.get("PROXXY_VALIDATION_URL", "https://www.netflix.com")
     validator_workers = int(os.environ.get("PROXXY_VALIDATOR_WORKERS", "512"))
     validator_timeout = float(os.environ.get("PROXXY_VALIDATOR_TIMEOUT", "5.0"))
@@ -51,7 +50,6 @@ def load_config_from_env() -> OrchestratorConfig:
     status_interval = int(os.environ.get("PROXXY_STATUS_INTERVAL_SECONDS", "5"))
     return OrchestratorConfig(
         output_dir=output_dir,
-        scrape_interval=scrape_interval,
         validation_url=validation_url,
         validator_workers=validator_workers,
         validator_timeout=validator_timeout,
@@ -357,7 +355,7 @@ def validator_worker(
 
 def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, status_queue=None) -> None:
     """
-    Child process loop: scrape -> validate -> publish -> sleep.
+    Child process continuous loop: scrape -> validate -> publish, then immediately repeat.
     Runs entirely via native Python imports (no CLI), in a single persistent process.
     Emits end-of-cycle metrics to a status_queue for live health reporting.
     """
@@ -527,7 +525,7 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
             "ts": time.time(),
         })
 
-        if stop.wait(cfg.scrape_interval):
+        if stop.is_set():
             break
 
 
@@ -677,7 +675,55 @@ def start(config: Optional[OrchestratorConfig] = None) -> threading.Event:
     raise RuntimeError("Programmatic start is not supported; run this module as a CLI: python -m src.main")
 
 
+def _parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    """
+    CLI to override environment variables. Precedence: CLI > env > defaults.
+    Note: No interval flag; pipeline is continuous.
+    """
+    ap = argparse.ArgumentParser(
+        prog="proXXy",
+        description="Continuous proxy pipeline: scrape -> validate -> publish, with proxy.py upstream rotation.",
+    )
+    # Only set values when flags are provided (no default), so env/defaults remain if omitted.
+    ap.add_argument("--output-dir", dest="output_dir", help="Override PROXXY_OUTPUT_DIR")
+    ap.add_argument("--url", dest="validation_url", help="Override PROXXY_VALIDATION_URL")
+    ap.add_argument("--workers", dest="validator_workers", type=int, help="Override PROXXY_VALIDATOR_WORKERS")
+    ap.add_argument("--timeout", dest="validator_timeout", type=float, help="Override PROXXY_VALIDATOR_TIMEOUT (seconds)")
+    ap.add_argument("--host", dest="proxy_host", help="Override PROXXY_PROXY_HOST")
+    ap.add_argument("--port", dest="proxy_port", type=int, help="Override PROXXY_PROXY_PORT")
+    ap.add_argument("--proxy-log-level", dest="proxy_log_level", help="Override PROXXY_PROXY_LOG_LEVEL (e.g., WARNING, INFO)")
+    ap.add_argument("--status-interval", dest="status_interval", type=int, help="Override PROXXY_STATUS_INTERVAL_SECONDS")
+    ap.add_argument("--snapshot-path", dest="work_with_scheme_path", help="Override PROXXY_WORK_WITH_SCHEME_PATH")
+    # Optional convenience flags: pass-through to env for dependent components
+    ap.add_argument("--scraper-log-level", dest="scraper_log_level", help="Set PROXXY_SCRAPER_LOG_LEVEL for Scrapy logs")
+    ap.add_argument(
+        "--proxy-capture-output",
+        dest="proxy_capture_output",
+        choices=["0", "1"],
+        help="Set PROXXY_PROXY_CAPTURE_OUTPUT (1 to capture proxy.py stdout/stderr into main logs, 0 to suppress)",
+    )
+    return ap.parse_args(argv)
+
+
 def main() -> int:
+    # Parse CLI and map provided flags to environment variables before loading config.
+    args = _parse_cli_args()
+    cli_to_env = {
+        "output_dir": "PROXXY_OUTPUT_DIR",
+        "validation_url": "PROXXY_VALIDATION_URL",
+        "validator_workers": "PROXXY_VALIDATOR_WORKERS",
+        "validator_timeout": "PROXXY_VALIDATOR_TIMEOUT",
+        "proxy_host": "PROXXY_PROXY_HOST",
+        "proxy_port": "PROXXY_PROXY_PORT",
+        "proxy_log_level": "PROXXY_PROXY_LOG_LEVEL",
+        "status_interval": "PROXXY_STATUS_INTERVAL_SECONDS",
+        "work_with_scheme_path": "PROXXY_WORK_WITH_SCHEME_PATH",
+        "scraper_log_level": "PROXXY_SCRAPER_LOG_LEVEL",
+        "proxy_capture_output": "PROXXY_PROXY_CAPTURE_OUTPUT",
+    }
+    for attr, env_key in cli_to_env.items():
+        if hasattr(args, attr) and getattr(args, attr) is not None:
+            os.environ[env_key] = str(getattr(args, attr))
     cfg = load_config_from_env()
     os.makedirs(cfg.output_dir, exist_ok=True)
 
@@ -695,10 +741,9 @@ def main() -> int:
 
     # Log config summary for at-a-glance visibility
     logger.info(
-        "config: output_dir='%s' snapshot='%s' scrape_interval=%ss validate_url='%s' validator_workers=%d timeout=%.1fs proxy=%s:%d status_interval=%ss",
+        "config: output_dir='%s' snapshot='%s' validate_url='%s' validator_workers=%d timeout=%.1fs proxy=%s:%d status_interval=%ss",
         cfg.output_dir,
         cfg.work_with_scheme_path,
-        cfg.scrape_interval,
         cfg.validation_url,
         cfg.validator_workers,
         cfg.validator_timeout,
