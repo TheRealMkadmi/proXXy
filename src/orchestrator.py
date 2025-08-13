@@ -140,6 +140,14 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
             if logger.isEnabledFor(logging.DEBUG):
                 sample = ", ".join(candidates[:3])
                 logger.debug("produce: sample candidates: %s%s", sample, " ..." if len(candidates) > 3 else "")
+            # Emit validate_start for in-progress visibility
+            emit({
+                "type": "validate_start",
+                "cycle": cycle,
+                "total": candidates_count,
+                "workers": workers,
+                "ts": time.time(),
+            })
 
             # Streaming validation: push to pool in near real-time (tiny batching)
             from urllib.request import Request, urlopen as _urlopen
@@ -153,6 +161,7 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
                 nonlocal batch, last_flush, publish_size
                 if not batch:
                     return
+                count = len(batch)
                 body = ("\n".join(batch) + "\n").encode("utf-8")
                 try:
                     req = Request(add_endpoint, data=body, headers={"Content-Type": "text/plain; charset=utf-8"}, method="POST")
@@ -165,6 +174,10 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
                                 code = 200
                     if 200 <= int(code) < 300:
                         publish_size += len(body)
+                        try:
+                            emit({"type": "publish_flush", "count": int(count), "bytes": int(len(body)), "ts": time.time()})
+                        except Exception:
+                            pass
                         batch.clear()
                         last_flush = time.perf_counter()
                     else:
@@ -175,6 +188,9 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
                     logger.exception("publish: error: %s", e)
 
             t1 = time.perf_counter()
+            # In-progress counters for status ticker
+            progress_completed = 0
+            last_prog_emit = t1
 
             def on_live(proxy: str, details):
                 nonlocal live_count, last_flush
@@ -185,6 +201,25 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
                 if len(batch) >= 50 or (now - last_flush) >= 0.2:
                     _flush_batch()
 
+            def on_result(details):
+                nonlocal progress_completed, last_prog_emit
+                progress_completed += 1
+                now2 = time.perf_counter()
+                if (now2 - last_prog_emit) >= 1.0:
+                    try:
+                        emit({
+                            "type": "validate_progress",
+                            "cycle": cycle,
+                            "completed": progress_completed,
+                            "live": live_count,
+                            "total": candidates_count,
+                            "workers": workers,
+                            "ts": time.time(),
+                        })
+                    except Exception:
+                        pass
+                    last_prog_emit = now2
+
             try:
                 _live_sorted, _details = validator_mod.check_proxies_stream(
                     candidates,
@@ -192,7 +227,7 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
                     workers,
                     float(cfg.validator_timeout),
                     on_live=on_live,
-                    on_result=None,
+                    on_result=on_result,
                     verify_ssl=True,
                     user_agent=None,
                     total=candidates_count,
@@ -200,6 +235,19 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
                 )
                 # final flush
                 _flush_batch()
+                # final progress emit
+                try:
+                    emit({
+                        "type": "validate_progress",
+                        "cycle": cycle,
+                        "completed": progress_completed,
+                        "live": live_count,
+                        "total": candidates_count,
+                        "workers": workers,
+                        "ts": time.time(),
+                    })
+                except Exception:
+                    pass
                 validate_dt = time.perf_counter() - t1
                 published = live_count > 0
                 logger.info("produce: streamed to pool live=%d (validator %.2fs)", live_count, validate_dt)

@@ -13,6 +13,7 @@ dependencies = [
 	"urllib3>=2.2.0",
 	"loguru>=0.7.2",
     "proxy.py>=2.4.4,<3.0.0",
+    "colorama>=0.4.6,<1.0.0",
 ]
 
 [build-system]

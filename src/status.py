@@ -4,7 +4,9 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
+from colorama import Fore, Style, init as colorama_init
 
+colorama_init(autoreset=True)
 logger = logging.getLogger("proXXy.status")
 
 __all__ = [
@@ -65,6 +67,16 @@ class Health:
     snapshot_path: str = ""
     output_dir: str = ""
     combined_input_size: int = 0
+    # In-progress metrics
+    validating: bool = False
+    candidates_total: int = 0
+    completed: int = 0
+    live_so_far: int = 0
+    last_progress_time: float = 0.0
+    publish_bytes_total: int = 0
+    publish_flush_count: int = 0
+    last_publish_count: int = 0
+    pool_url: str = ""
 
 
 def status_consumer(status_q, health: "Health", stop_evt: threading.Event) -> None:
@@ -89,6 +101,38 @@ def status_consumer(status_q, health: "Health", stop_evt: threading.Event) -> No
                 health.last_validate_dt = float(evt.get("validate_dt") or 0.0)
                 health.validator_workers = int(evt.get("workers") or 0)
                 health.combined_input_size = int(evt.get("combined_input_size") or 0)
+                # End-of-cycle: mark validation complete
+                health.validating = False
+            elif typ == "validate_start":
+                health.validating = True
+                health.candidates_total = int(evt.get("total") or 0)
+                health.completed = 0
+                health.live_so_far = 0
+                health.validator_workers = int(evt.get("workers") or health.validator_workers)
+                health.last_progress_time = float(evt.get("ts") or time.time())
+            elif typ == "validate_progress":
+                # Throttled progress updates
+                health.completed = int(evt.get("completed") or health.completed)
+                health.live_so_far = int(evt.get("live") or health.live_so_far)
+                if evt.get("total") is not None:
+                    health.candidates_total = int(evt.get("total") or health.candidates_total)
+                if evt.get("workers") is not None:
+                    health.validator_workers = int(evt.get("workers") or health.validator_workers)
+                health.last_progress_time = float(evt.get("ts") or time.time())
+            elif typ == "publish_flush":
+                # Accumulate published bytes and remember last flush
+                try:
+                    b = int(evt.get("bytes") or 0)
+                except Exception:
+                    b = 0
+                try:
+                    cnt = int(evt.get("count") or 0)
+                except Exception:
+                    cnt = 0
+                health.publish_bytes_total += max(0, b)
+                health.publish_flush_count += 1
+                health.last_publish_count = cnt
+                health.last_publish_time = float(evt.get("ts") or time.time())
             elif typ == "proxy_started":
                 try:
                     pid_val = evt.get("pid")
@@ -104,29 +148,74 @@ def status_consumer(status_q, health: "Health", stop_evt: threading.Event) -> No
                     health.snapshot_path = str(evt.get("snapshot_path"))
                 if evt.get("output_dir"):
                     health.output_dir = str(evt.get("output_dir"))
+                if evt.get("pool_url"):
+                    health.pool_url = str(evt.get("pool_url"))
             # Other event types are informational
 
 
 def status_ticker(health: "Health", stop_evt: threading.Event, interval_s: float) -> None:
     if interval_s <= 0:
         return
+
+    def _get_pool_size(url: str) -> int:
+        if not url:
+            return -1
+        try:
+            from urllib.request import urlopen
+            with urlopen(url.rstrip("/") + "/pool", timeout=0.3) as resp:
+                data = resp.read().decode("utf-8", errors="replace")
+            # Count non-empty, non-comment lines
+            return sum(1 for ln in data.splitlines() if ln.strip() and not ln.lstrip().startswith("#"))
+        except Exception:
+            return -1
+
     while not stop_evt.wait(interval_s):
         with health.lock:
             cycles = health.cycles
-            live = health.last_validate_live
-            candidates = health.last_candidates
-            workers = health.validator_workers
+            # Finalized metrics from last completed cycle
+            last_live = health.last_validate_live
+            last_candidates = health.last_candidates
             scrape_dt = health.last_scrape_dt
             validate_dt = health.last_validate_dt
-            pub_size = health.last_publish_size
-            last_pub = health.last_publish_time
+            pub_file_size = health.last_publish_size
+            last_pub_ts = health.last_publish_time
+            # In-progress metrics
+            validating = health.validating
+            total = health.candidates_total
+            completed = health.completed
+            live_so_far = health.live_so_far
+            publish_bytes_total = health.publish_bytes_total
+            publish_flush_count = health.publish_flush_count
+            workers = health.validator_workers
+            # Proxy / pool
             pid = health.proxy_pid
             running = health.proxy_running
             restarts = health.proxy_restarts
-        since_pub = humanize_duration(time.time() - last_pub) if last_pub else "never"
-        size_str = humanize_bytes(pub_size) if pub_size else "0B"
-        proxy_str = f"up pid={pid}" if running and pid else "down"
-        logger.info(
-            "status: cycles=%s | live=%s | candidates=%s | last_pub=%s | file=%s | scrape=%ss | validate=%ss | workers=%s | proxy=%s | restarts=%s",
-            cycles, live, candidates, since_pub, size_str, f"{scrape_dt:.2f}", f"{validate_dt:.2f}", workers, proxy_str, restarts
-        )
+            pool_url = health.pool_url
+
+        pool_size = _get_pool_size(pool_url) if pool_url else -1
+        since_pub = humanize_duration(time.time() - last_pub_ts) if last_pub_ts else "never"
+        last_file_size_str = humanize_bytes(pub_file_size) if pub_file_size else "0B"
+        total_pub_str = humanize_bytes(publish_bytes_total) if publish_bytes_total else "0B"
+        proxy_state = (Fore.GREEN + f"UP pid={pid}" + Style.RESET_ALL) if (running and pid) else (Fore.RED + "DOWN" + Style.RESET_ALL)
+
+        if validating and total > 0:
+            pct = (completed / max(1, total)) * 100.0
+            msg = (
+                f"{Fore.CYAN}cycle{Style.RESET_ALL}={cycles} "
+                f"| {Fore.YELLOW}validate{Style.RESET_ALL}={completed}/{total} ({pct:.1f}%) "
+                f"live={live_so_far} w={workers} "
+                f"| {Fore.MAGENTA}publish{Style.RESET_ALL}=flushes={publish_flush_count} total={total_pub_str} last={since_pub} "
+                f"| {Fore.BLUE}pool{Style.RESET_ALL}={(pool_size if pool_size >= 0 else '?')} "
+                f"| {proxy_state} restarts={restarts}"
+            )
+        else:
+            msg = (
+                f"{Fore.CYAN}cycle{Style.RESET_ALL}={cycles} "
+                f"| {Fore.YELLOW}validate{Style.RESET_ALL}=idle live={last_live} cand={last_candidates} "
+                f"dur={scrape_dt:.2f}s/{validate_dt:.2f}s w={workers} "
+                f"| {Fore.MAGENTA}publish{Style.RESET_ALL}=file={last_file_size_str} last={since_pub} "
+                f"| {Fore.BLUE}pool{Style.RESET_ALL}={(pool_size if pool_size >= 0 else '?')} "
+                f"| {proxy_state} restarts={restarts}"
+            )
+        logger.info(msg)
