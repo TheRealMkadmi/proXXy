@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -349,9 +350,18 @@ class PoolServer:
                 resp = sess.get(
                     health_url, proxies=proxies, timeout=self.recheck_timeout, stream=True, allow_redirects=True
                 )
-                for _ in resp.iter_content(chunk_size=1):
-                    break
-                ok = 200 <= resp.status_code < 300
+                # Tunables (fallback to validator defaults)
+                min_bytes = int(os.getenv("PROXXY_POOL_RECHECK_MIN_BYTES", os.getenv("PROXXY_VALIDATOR_MIN_BYTES", "2048")))
+                read_window = float(os.getenv("PROXXY_POOL_RECHECK_READ_SECONDS", os.getenv("PROXXY_VALIDATOR_READ_SECONDS", "1.5")))
+                total = 0
+                t_start = time.monotonic()
+                for chunk in resp.iter_content(chunk_size=2048):
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total >= min_bytes or (time.monotonic() - t_start) >= read_window:
+                        break
+                ok = (200 <= resp.status_code < 400) and (total >= max(1, min_bytes // 4))
                 resp.close()
                 return pxy, ok
             except Exception:

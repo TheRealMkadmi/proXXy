@@ -73,9 +73,12 @@ def _check_one(
 ) -> Tuple[str, bool, Optional[int], Optional[str], Optional[float], Optional[str]]:
     sess = _get_session(timeout, verify_ssl, user_agent)
     proxies = {"http": proxy, "https": proxy}
+    # Tunables to ensure stability rather than "first byte wins"
+    MIN_BYTES = int(os.getenv("PROXXY_VALIDATOR_MIN_BYTES", "4096"))
+    READ_WINDOW = float(os.getenv("PROXXY_VALIDATOR_READ_SECONDS", "2.0"))
     try:
         t0 = time.monotonic()
-        # Stream to avoid downloading full bodies; follow redirects; small timeout
+        # Stream to avoid full downloads; follow redirects; bounded timeout
         resp = sess.get(
             url,
             proxies=proxies,
@@ -83,10 +86,17 @@ def _check_one(
             stream=True,
             allow_redirects=True,
         )
-        # Read a tiny chunk to trigger the connection/body without full download
-        for _ in resp.iter_content(chunk_size=1):
-            break
-        ok = 200 <= resp.status_code < 300
+        # Read until we either gather enough bytes or we spend the small time budget.
+        total = 0
+        t_start = time.monotonic()
+        for chunk in resp.iter_content(chunk_size=2048):
+            if not chunk:
+                break
+            total += len(chunk)
+            if total >= MIN_BYTES or (time.monotonic() - t_start) >= READ_WINDOW:
+                break
+        # Consider 2xx-3xx OK and require a minimum payload fraction to reject early-canceling tunnels.
+        ok = (200 <= resp.status_code < 400) and (total >= max(1, MIN_BYTES // 4))
         # Prefer server-reported elapsed if available, else fallback to measured
         elapsed = None
         try:

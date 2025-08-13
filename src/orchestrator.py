@@ -369,6 +369,42 @@ def proxy_server_loop(stop: threading.Event, config: Optional[OrchestratorConfig
                         t_err.start()
                         reader_threads.append(t_err)
 
+                # Announce readiness once upstreams are available in the pool
+                def _ready_watch():
+                    try:
+                        from urllib.request import urlopen as _urlopen
+                        from urllib.error import URLError, HTTPError
+                    except Exception:
+                        return
+                    pool_url = env.get("PROXXY_POOL_URL", f"http://{cfg.pool_host}:{cfg.pool_port}")
+                    endpoint = f"{pool_url.rstrip('/')}/pool"
+                    # Poll until either upstreams are present, the proxy stops, or shutdown requested
+                    while not stop.is_set():
+                        # If process not available or exited, stop watcher
+                        local_proc = proc
+                        if local_proc is None or local_proc.poll() is not None:
+                            return
+                        try:
+                            with _urlopen(endpoint, timeout=1.5) as resp:
+                                data = resp.read().decode("utf-8", errors="replace")
+                            count = sum(1 for ln in data.splitlines() if ln.strip() and not ln.startswith("#"))
+                            if count > 0:
+                                logger.info("proxy: ready (listening %s:%d; upstreams=%d)", host, port, count)
+                                try:
+                                    emit({"type": "proxy_ready", "upstreams": int(count)})
+                                except Exception:
+                                    pass
+                                return
+                        except (HTTPError, URLError, TimeoutError, OSError):
+                            # transient; keep polling
+                            pass
+                        except Exception:
+                            # never crash watcher
+                            pass
+                        # backoff a bit
+                        stop.wait(0.5)
+                threading.Thread(target=_ready_watch, name="proxy-ready", daemon=True).start()
+
                 while not stop.is_set():
                     ret = proc.poll()
                     if ret is not None:

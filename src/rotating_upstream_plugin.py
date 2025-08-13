@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import time
 import threading
+import logging
 from typing import Deque, Optional, List
 from collections import deque
 
@@ -44,6 +45,7 @@ class RotatingUpstreamPlugin(HttpProxyBasePlugin):
     _lock = threading.RLock()
     _dq: Deque[bytes] = deque()
     _refresher_started: bool = False
+    _had_upstreams: bool = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -60,6 +62,8 @@ class RotatingUpstreamPlugin(HttpProxyBasePlugin):
 
             def _refresher():
                 url = f"{POOL_URL.rstrip('/')}/pool"
+                # Local logger for plugin readiness (inherits proxy.py log configuration)
+                _logger = logging.getLogger("proXXy.plugin")
                 while True:
                     try:
                         with urlopen(url, timeout=max(1.0, REFRESH_INTERVAL * 3)) as resp:
@@ -78,7 +82,22 @@ class RotatingUpstreamPlugin(HttpProxyBasePlugin):
                                 # Skip malformed entries
                                 continue
                         with cls._lock:
+                            prev = len(cls._dq)
                             cls._dq = deque(items)
+                            new = len(cls._dq)
+                            # Log transitions into/out of "ready" state within the proxy subprocess
+                            if (not cls._had_upstreams) and new > 0:
+                                cls._had_upstreams = True
+                                try:
+                                    _logger.info("proxy.plugin: upstreams available count=%d pool=%s", new, POOL_URL)
+                                except Exception:
+                                    pass
+                            elif cls._had_upstreams and new == 0:
+                                cls._had_upstreams = False
+                                try:
+                                    _logger.warning("proxy.plugin: upstreams depleted; waiting for pool=%s", POOL_URL)
+                                except Exception:
+                                    pass
                     except (HTTPError, URLError, TimeoutError, OSError):
                         # Keep previous deque on transient errors
                         pass
