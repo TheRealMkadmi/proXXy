@@ -6,74 +6,90 @@ import threading
 from typing import Deque, Optional, List
 from collections import deque
 
+# Use stdlib HTTP client to avoid extra deps in proxy.py process
+from urllib.request import urlopen
+from urllib.error import URLError, HTTPError
+
 # proxy.py plugin API
-# Docs pattern: subclass HttpProxyBasePlugin and implement get_upstream_proxy()
 try:
     from proxy.http.proxy import HttpProxyBasePlugin  # proxy.py >= 2.x
 except Exception as e:  # pragma: no cover
     raise ImportError("proxy.py is required for RotatingUpstreamPlugin") from e
 
 
-# Path from which to read live proxies (one per line), each line scheme://host:port
-OUTPUT_DIR = os.environ.get("PROXXY_OUTPUT_DIR", "output")
-WORK_WITH_SCHEME = os.environ.get("PROXXY_WORK_WITH_SCHEME_PATH", os.path.join(OUTPUT_DIR, "work_with_scheme.txt"))
-# Throttle reload frequency to avoid excessive I/O
-RELOAD_INTERVAL = float(os.environ.get("PROXXY_PLUGIN_RELOAD_INTERVAL", "5.0"))
+# Real-time pool source (HTTP), not disk
+POOL_HOST = os.environ.get("PROXXY_POOL_HOST", "127.0.0.1")
+try:
+    POOL_PORT = int(os.environ.get("PROXXY_POOL_PORT", "9009"))
+except Exception:
+    POOL_PORT = 9009
+POOL_URL = os.environ.get("PROXXY_POOL_URL", f"http://{POOL_HOST}:{POOL_PORT}")
+# Poll interval in milliseconds (default: 500ms)
+try:
+    _ms = int(os.environ.get("PROXXY_POOL_REFRESH_MS", "500"))
+except Exception:
+    _ms = 500
+REFRESH_INTERVAL = max(0.1, _ms / 1000.0)
 
 
 class RotatingUpstreamPlugin(HttpProxyBasePlugin):
     """
     A proxy.py plugin that assigns a single upstream per client TCP connection (sticky).
 
-    - Picks next value from a process-wide deque loaded from WORK_WITH_SCHEME.
-    - Auto-reloads the file when it changes (mtime-based) at most once per RELOAD_INTERVAL.
+    - Maintains a process-wide deque of upstreams fetched from an HTTP pool service.
+    - Background refresher polls GET {POOL_URL}/pool every REFRESH_INTERVAL.
     - If no upstreams are available, this plugin fails fast by raising ValueError.
     """
 
     _lock = threading.RLock()
-    _last_checked: float = 0.0
-    _last_mtime: float = 0.0
     _dq: Deque[bytes] = deque()
+    _refresher_started: bool = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Cache the first selected upstream for the lifetime of this client connection
         self._assigned_upstream: Optional[bytes] = None
+        self._ensure_refresher()
 
     @classmethod
-    def _reload_if_needed(cls) -> None:
-        now = time.time()
-        if now - cls._last_checked < RELOAD_INTERVAL:
-            return
-        cls._last_checked = now
-        path = WORK_WITH_SCHEME
-        try:
-            st = os.stat(path)
-            # Only reload on mtime change
-            if st.st_mtime <= cls._last_mtime:
+    def _ensure_refresher(cls) -> None:
+        # Guard refresher startup to avoid races and set the flag only after thread is running
+        with cls._lock:
+            if cls._refresher_started:
                 return
-            cls._last_mtime = st.st_mtime
-            items: List[bytes] = []
-            with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                    s = line.strip()
-                    if not s or s.startswith("#"):
-                        continue
-                    # Ensure a scheme for proxy.py upstream string
-                    if "://" not in s:
-                        s = "http://" + s
+
+            def _refresher():
+                url = f"{POOL_URL.rstrip('/')}/pool"
+                while True:
                     try:
-                        items.append(s.encode("utf-8"))
+                        with urlopen(url, timeout=max(1.0, REFRESH_INTERVAL * 3)) as resp:
+                            # Expect text/plain with one proxy per line (scheme://host:port)
+                            data = resp.read().decode("utf-8", errors="replace")
+                        items: List[bytes] = []
+                        for line in data.splitlines():
+                            s = line.strip()
+                            if not s or s.startswith("#"):
+                                continue
+                            if "://" not in s:
+                                s = "http://" + s
+                            try:
+                                items.append(s.encode("utf-8"))
+                            except Exception:
+                                # Skip malformed entries
+                                continue
+                        with cls._lock:
+                            cls._dq = deque(items)
+                    except (HTTPError, URLError, TimeoutError, OSError):
+                        # Keep previous deque on transient errors
+                        pass
                     except Exception:
-                        # Skip malformed lines
-                        continue
-            cls._dq = deque(items)
-        except FileNotFoundError:
-            cls._dq = deque()
-            cls._last_mtime = 0.0
-        except OSError:
-            # Leave current deque untouched on transient I/O errors
-            pass
+                        # Avoid crashing refresher
+                        pass
+                    time.sleep(REFRESH_INTERVAL)
+
+            t = threading.Thread(target=_refresher, name="pool-refresher", daemon=True)
+            t.start()
+            cls._refresher_started = True
 
     # Hook used by proxy.py to fetch upstream once per client connection (sticky)
     def get_upstream_proxy(self) -> Optional[bytes]:
@@ -82,7 +98,6 @@ class RotatingUpstreamPlugin(HttpProxyBasePlugin):
             if getattr(self, "_assigned_upstream", None):
                 return self._assigned_upstream
 
-            self._reload_if_needed()
             if not self._dq:
                 # Fail fast when no upstreams are available
                 raise ValueError("No upstream proxies available")
