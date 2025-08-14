@@ -15,7 +15,7 @@ from .config import OrchestratorConfig, load_config_from_env
 logger = logging.getLogger("proXXy.orchestrator")
 
 
-def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, status_queue=None) -> None:
+def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, status_queue=None, pool_queue=None) -> None:
     """
     Child process continuous loop: scrape -> validate -> publish (to pool), then immediately repeat.
     Runs entirely via native Python imports (no CLI), in a single persistent process.
@@ -47,7 +47,7 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
 
     os.makedirs(cfg.output_dir, exist_ok=True)
 
-    pool_url = f"http://{cfg.pool_host}:{cfg.pool_port}"
+    # publishing via pool_queue (IPC), no HTTP pool
 
     cycle = 0
     while not stop.is_set():
@@ -149,11 +149,7 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
                 "ts": time.time(),
             })
 
-            # Streaming validation: push to pool in near real-time (tiny batching)
-            from urllib.request import Request, urlopen as _urlopen
-            from urllib.error import URLError, HTTPError
-
-            add_endpoint = f"{pool_url.rstrip('/')}/add"
+            # Streaming validation: push to pool in near real-time (tiny batching) via IPC queue
             batch: List[str] = []
             last_flush = time.perf_counter()
 
@@ -162,30 +158,28 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
                 if not batch:
                     return
                 count = len(batch)
-                body = ("\n".join(batch) + "\n").encode("utf-8")
                 try:
-                    req = Request(add_endpoint, data=body, headers={"Content-Type": "text/plain; charset=utf-8"}, method="POST")
-                    with _urlopen(req, timeout=2.0) as resp:
-                        code = getattr(resp, "status", None)
-                        if code is None:
-                            try:
-                                code = resp.getcode()
-                            except Exception:
-                                code = 200
-                    if 200 <= int(code) < 300:
-                        publish_size += len(body)
+                    # send a single message to reduce overhead
+                    if pool_queue is not None:
                         try:
-                            emit({"type": "publish_flush", "count": int(count), "bytes": int(len(body)), "ts": time.time()})
+                            pool_queue.put({"type": "add", "proxies": list(batch)}, timeout=0.1)
                         except Exception:
-                            pass
-                        batch.clear()
-                        last_flush = time.perf_counter()
-                    else:
-                        logger.warning("publish: non-2xx status code=%s (will retry on next flush)", code)
-                except (HTTPError, URLError, TimeoutError, OSError) as e:
-                    logger.warning("publish: transient error: %s (will retry on next flush)", e)
-                except Exception as e:
-                    logger.exception("publish: error: %s", e)
+                            # best-effort fallback: split if oversized
+                            try:
+                                for i in range(0, len(batch), 2000):
+                                    pool_queue.put({"type": "add", "proxies": batch[i:i+2000]}, timeout=0.1)
+                            except Exception:
+                                pass
+                    # estimate bytes similar to previous HTTP body size
+                    body_bytes = len(("\n".join(batch) + "\n").encode("utf-8"))
+                    publish_size += body_bytes
+                    try:
+                        emit({"type": "publish_flush", "count": int(count), "bytes": int(body_bytes), "ts": time.time()})
+                    except Exception:
+                        pass
+                finally:
+                    batch.clear()
+                    last_flush = time.perf_counter()
 
             t1 = time.perf_counter()
             # In-progress counters for status ticker
@@ -274,11 +268,13 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
             break
 
 
-def proxy_server_loop(stop: threading.Event, config: Optional[OrchestratorConfig] = None, status_queue=None) -> None:
+def mubeng_server_loop(stop: threading.Event, config: Optional[OrchestratorConfig] = None, status_queue=None) -> None:
     """
-    Starts proxy.py as a subprocess with a rotating-upstream plugin that fetches pool state
-    via HTTP and assigns one upstream per TCP connection (sticky).
-    Emits lifecycle events to a status_queue for live health reporting.
+    Start mubeng as a subprocess and supervise it.
+
+    - Listens on cfg.proxy_host:cfg.proxy_port
+    - Reads upstream proxies from cfg.pool_file_path (-f) and watches changes (-w)
+    - Emits lifecycle events to status_queue: proxy_starting, proxy_started, proxy_ready (when proxies file has entries), proxy_exit
     """
     cfg = config or load_config_from_env()
 
@@ -290,38 +286,26 @@ def proxy_server_loop(stop: threading.Event, config: Optional[OrchestratorConfig
         except Exception:
             pass
 
-    env = os.environ.copy()
-    # Ensure plugin module is importable
-    src_dir = os.path.abspath(os.path.dirname(__file__))
-    existing_pp = env.get("PYTHONPATH", "")
-    if src_dir not in (existing_pp.split(os.pathsep) if existing_pp else []):
-        env["PYTHONPATH"] = src_dir + (os.pathsep + existing_pp if existing_pp else "")
-
-    # Expose pool endpoint to plugin
-    env["PROXXY_POOL_HOST"] = cfg.pool_host
-    env["PROXXY_POOL_PORT"] = str(cfg.pool_port)
-    env["PROXXY_POOL_URL"] = f"http://{cfg.pool_host}:{cfg.pool_port}"
-    env["PROXXY_POOL_REFRESH_MS"] = str(cfg.pool_refresh_ms)
-
     host = cfg.proxy_host
     port = cfg.proxy_port
-    log_level = cfg.proxy_log_level
+    pool_file = cfg.pool_file_path
+    mubeng_bin = getattr(cfg, "mubeng_bin", "mubeng") or "mubeng"
+    mubeng_extra = (getattr(cfg, "mubeng_extra", "") or "").strip()
 
-    logger.info("proxy: starting with pool endpoint %s", env["PROXXY_POOL_URL"])
-
-    cmd = [
-        sys.executable, "-m", "proxy",
-        "--hostname", host,
-        "--port", str(port),
-        "--plugins", "rotating_upstream_plugin.RotatingUpstreamPlugin",
-        "--log-level", log_level,
-    ]
+    # Build base command
+    cmd = [mubeng_bin, "-l", f"{host}:{port}", "-f", pool_file, "-w"]
+    # Append extra flags if provided
+    if mubeng_extra:
+        try:
+            cmd.extend(shlex.split(mubeng_extra))
+        except Exception:
+            # Fallback: append raw string
+            cmd.append(mubeng_extra)
 
     proc = None
     try:
         while not stop.is_set():
             try:
-                # Decide whether to capture proxy.py subprocess output
                 capture = os.environ.get("PROXXY_PROXY_CAPTURE_OUTPUT", "0").lower() not in ("0", "false", "no")
                 stdout_target = subprocess.PIPE if capture else subprocess.DEVNULL
                 stderr_target = subprocess.PIPE if capture else subprocess.DEVNULL
@@ -334,7 +318,6 @@ def proxy_server_loop(stop: threading.Event, config: Optional[OrchestratorConfig
                 emit({"type": "proxy_starting"})
                 proc = subprocess.Popen(
                     cmd,
-                    env=env,
                     stdin=subprocess.DEVNULL,
                     stdout=stdout_target,
                     stderr=stderr_target,
@@ -343,13 +326,13 @@ def proxy_server_loop(stop: threading.Event, config: Optional[OrchestratorConfig
                     errors=errors,
                     bufsize=bufsize,
                 )
-                logger.info("proxy: listening on %s:%d (pid=%s)", host, port, getattr(proc, "pid", "?"))
+                logger.info("proxy: listening (mubeng) on %s:%d (pid=%s) file=%s", host, port, getattr(proc, "pid", "?"), pool_file)
                 try:
                     emit({"type": "proxy_started", "pid": int(getattr(proc, "pid", 0) or 0)})
                 except Exception:
                     emit({"type": "proxy_started"})
 
-                # If capturing, stream subprocess output into our logger
+                # Optional: stream subprocess output into our logger
                 reader_threads = []
                 if capture:
                     def _reader(stream, name, level):
@@ -357,69 +340,67 @@ def proxy_server_loop(stop: threading.Event, config: Optional[OrchestratorConfig
                             for line in iter(stream.readline, ""):
                                 if not line:
                                     break
-                                logger.log(level, "proxy-subproc %s: %s", name, line.rstrip())
+                                logger.log(level, "mubeng-subproc %s: %s", name, line.rstrip())
                         except Exception:
                             pass
                     if proc.stdout:
-                        t_out = threading.Thread(target=_reader, args=(proc.stdout, "stdout", logging.DEBUG), name="proxy-stdout", daemon=True)
+                        t_out = threading.Thread(target=_reader, args=(proc.stdout, "stdout", logging.DEBUG), name="mubeng-stdout", daemon=True)
                         t_out.start()
                         reader_threads.append(t_out)
                     if proc.stderr:
-                        t_err = threading.Thread(target=_reader, args=(proc.stderr, "stderr", logging.WARNING), name="proxy-stderr", daemon=True)
+                        t_err = threading.Thread(target=_reader, args=(proc.stderr, "stderr", logging.WARNING), name="mubeng-stderr", daemon=True)
                         t_err.start()
                         reader_threads.append(t_err)
 
-                # Announce readiness once upstreams are available in the pool
+                # Announce readiness once proxies file has entries
                 def _ready_watch():
-                    try:
-                        from urllib.request import urlopen as _urlopen
-                        from urllib.error import URLError, HTTPError
-                    except Exception:
-                        return
-                    pool_url = env.get("PROXXY_POOL_URL", f"http://{cfg.pool_host}:{cfg.pool_port}")
-                    endpoint = f"{pool_url.rstrip('/')}/pool"
-                    # Poll until either upstreams are present, the proxy stops, or shutdown requested
                     while not stop.is_set():
-                        # If process not available or exited, stop watcher
+                        # Stop watcher if process exited
                         local_proc = proc
                         if local_proc is None or local_proc.poll() is not None:
                             return
                         try:
-                            with _urlopen(endpoint, timeout=1.5) as resp:
-                                data = resp.read().decode("utf-8", errors="replace")
-                            count = sum(1 for ln in data.splitlines() if ln.strip() and not ln.startswith("#"))
+                            count = 0
+                            with open(pool_file, "r", encoding="utf-8") as f:
+                                for ln in f:
+                                    s = ln.strip()
+                                    if s and not s.lstrip().startswith("#"):
+                                        count += 1
+                                        if count > 0:
+                                            break
                             if count > 0:
-                                logger.info("proxy: ready (listening %s:%d; upstreams=%d)", host, port, count)
+                                logger.info("proxy: ready (mubeng %s:%d; upstreams>0)", host, port)
                                 try:
                                     emit({"type": "proxy_ready", "upstreams": int(count)})
                                 except Exception:
                                     pass
                                 return
-                        except (HTTPError, URLError, TimeoutError, OSError):
-                            # transient; keep polling
+                        except FileNotFoundError:
+                            # Not created yet; keep polling
                             pass
                         except Exception:
                             # never crash watcher
                             pass
-                        # backoff a bit
                         stop.wait(0.5)
                 threading.Thread(target=_ready_watch, name="proxy-ready", daemon=True).start()
 
+                # Supervise process
                 while not stop.is_set():
                     ret = proc.poll()
                     if ret is not None:
-                        logger.error("proxy: exited code=%s; restarting in 5s", ret)
+                        logger.error("proxy: mubeng exited code=%s; restarting in 5s", ret)
                         emit({"type": "proxy_exit", "code": int(ret)})
                         if stop.wait(5.0):
                             return
                         break
                     stop.wait(0.5)
+
             except FileNotFoundError:
-                logger.error("proxy: module not found. Install dependency 'proxy.py'.")
+                logger.error("proxy: mubeng binary not found (%s). Install 'mubeng' or set PROXXY_MUBENG_BIN", mubeng_bin)
                 stop.wait(5.0)
                 return
             except Exception as e:
-                logger.exception("proxy: error: %s", e)
+                logger.exception("proxy: mubeng supervisor error: %s", e)
                 if stop.wait(5.0):
                     return
             finally:
@@ -442,4 +423,4 @@ def proxy_server_loop(stop: threading.Event, config: Optional[OrchestratorConfig
                     proc.kill()
             except Exception:
                 pass
-        logger.info("proxy: stopped")
+        logger.info("proxy: stopped (mubeng)")

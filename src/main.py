@@ -11,8 +11,8 @@ import time
 # Keep main minimal: wire-up config, pool, producer, proxy, status
 from .config import OrchestratorConfig, load_config_from_env
 from .status import Health, status_consumer, status_ticker
-from .pool_server import PoolServer
-from .orchestrator import produce_process_loop, proxy_server_loop
+from .pool_manager import PoolManager, PoolManagerConfig, pool_ingest_loop
+from .orchestrator import produce_process_loop, mubeng_server_loop
 
 logger = logging.getLogger("proXXy.main")
 if not logger.handlers:
@@ -29,7 +29,7 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     """
     ap = argparse.ArgumentParser(
         prog="proXXy",
-        description="Continuous proxy pipeline: scrape -> validate (stream) -> pool -> proxy.py upstream rotation.",
+        description="Continuous proxy pipeline: scrape -> validate (stream) -> pool -> mubeng upstream rotation via file.",
     )
     # Only set values when flags are provided (no default), so env/defaults remain if omitted.
     ap.add_argument("--output-dir", dest="output_dir", help="Override PROXXY_OUTPUT_DIR")
@@ -41,13 +41,14 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--proxy-log-level", dest="proxy_log_level", help="Override PROXXY_PROXY_LOG_LEVEL (e.g., WARNING, INFO)")
     ap.add_argument("--status-interval", dest="status_interval", type=int, help="Override PROXXY_STATUS_INTERVAL_SECONDS")
 
-    # Pool service overrides
-    ap.add_argument("--pool-host", dest="pool_host", help="Override PROXXY_POOL_HOST (default 127.0.0.1)")
-    ap.add_argument("--pool-port", dest="pool_port", type=int, help="Override PROXXY_POOL_PORT (default 9009)")
-    ap.add_argument("--pool-refresh-ms", dest="pool_refresh_ms", type=int, help="Override PROXXY_POOL_REFRESH_MS (default 500)")
+    # File-backed pool and mubeng overrides
+    ap.add_argument("--pool-file", dest="pool_file", help="Override PROXXY_POOL_FILE (default ./proxies.txt)")
+    ap.add_argument("--pool-debounce-ms", dest="pool_debounce_ms", type=int, help="Override PROXXY_POOL_DEBOUNCE_MS (default 150)")
     ap.add_argument("--pool-ttl-seconds", dest="pool_ttl_seconds", type=int, help="Override PROXXY_POOL_TTL_SECONDS (default 900)")
     ap.add_argument("--pool-prune-interval-seconds", dest="pool_prune_interval_seconds", type=int, help="Override PROXXY_POOL_PRUNE_INTERVAL_SECONDS (default 30)")
     ap.add_argument("--pool-health-url", dest="pool_health_url", help="Override PROXXY_POOL_HEALTH_URL (default = validation URL)")
+    ap.add_argument("--mubeng-bin", dest="mubeng_bin", help="Override PROXXY_MUBENG_BIN (default 'mubeng')")
+    ap.add_argument("--mubeng-extra", dest="mubeng_extra", help="Override PROXXY_MUBENG_EXTRA (extra flags)")
 
     # Optional convenience flags
     ap.add_argument("--scraper-log-level", dest="scraper_log_level", help="Set PROXXY_SCRAPER_LOG_LEVEL for Scrapy logs")
@@ -72,13 +73,14 @@ def main() -> int:
         "proxy_port": "PROXXY_PROXY_PORT",
         "proxy_log_level": "PROXXY_PROXY_LOG_LEVEL",
         "status_interval": "PROXXY_STATUS_INTERVAL_SECONDS",
-        # Pool service
-        "pool_host": "PROXXY_POOL_HOST",
-        "pool_port": "PROXXY_POOL_PORT",
-        "pool_refresh_ms": "PROXXY_POOL_REFRESH_MS",
+        # File-backed pool + mubeng
+        "pool_file": "PROXXY_POOL_FILE",
+        "pool_debounce_ms": "PROXXY_POOL_DEBOUNCE_MS",
         "pool_ttl_seconds": "PROXXY_POOL_TTL_SECONDS",
         "pool_prune_interval_seconds": "PROXXY_POOL_PRUNE_INTERVAL_SECONDS",
         "pool_health_url": "PROXXY_POOL_HEALTH_URL",
+        "mubeng_bin": "PROXXY_MUBENG_BIN",
+        "mubeng_extra": "PROXXY_MUBENG_EXTRA",
         # Pass-through for dependent components
         "scraper_log_level": "PROXXY_SCRAPER_LOG_LEVEL",
         "proxy_capture_output": "PROXXY_PROXY_CAPTURE_OUTPUT",
@@ -105,16 +107,14 @@ def main() -> int:
     # Log config summary for at-a-glance visibility
     logger.info(
         "config: output_dir='%s' validate_url='%s' workers=%d timeout=%.1fs proxy=%s:%d "
-        "pool=%s:%d refresh_ms=%s ttl=%ss prune_interval=%ss status_interval=%ss",
+        "pool_file='%s' ttl=%ss prune_interval=%ss status_interval=%ss",
         cfg.output_dir,
         cfg.validation_url,
         cfg.validator_workers,
         cfg.validator_timeout,
         cfg.proxy_host,
         cfg.proxy_port,
-        cfg.pool_host,
-        cfg.pool_port,
-        cfg.pool_refresh_ms,
+        cfg.pool_file_path,
         getattr(cfg, "pool_ttl_seconds", 900),
         getattr(cfg, "pool_prune_interval_seconds", 30),
         getattr(cfg, "status_interval", 5),
@@ -125,7 +125,7 @@ def main() -> int:
         status_q.put({
             "type": "config",
             "output_dir": cfg.output_dir,
-            "pool_url": f"http://{cfg.pool_host}:{cfg.pool_port}",
+            "pool_file": cfg.pool_file_path,
         })
     except Exception:
         pass
@@ -136,34 +136,37 @@ def main() -> int:
     ticker_interval = float(getattr(cfg, "status_interval", 5))
     ticker_t = threading.Thread(target=status_ticker, name="status-ticker", args=(health, stop_thread, ticker_interval), daemon=True)
 
-    # Start pool HTTP server (with TTL and health re-check)
-    pool_server = None
+    # Start in-process PoolManager (TTL prune + optional recheck) and ingest thread
+    pool_mgr = None
+    pool_q = mp.Queue()
     try:
-        pool_server = PoolServer(
-            host=cfg.pool_host,
-            port=cfg.pool_port,
-            ttl_seconds=getattr(cfg, "pool_ttl_seconds", 900),
-            prune_interval_seconds=getattr(cfg, "pool_prune_interval_seconds", 30),
-            health_check_url=getattr(cfg, "pool_health_url", cfg.validation_url),
+        pool_mgr = PoolManager(
+            PoolManagerConfig(
+                file_path=cfg.pool_file_path,
+                debounce_ms=cfg.pool_debounce_ms,
+                ttl_seconds=getattr(cfg, "pool_ttl_seconds", 900),
+                prune_interval_seconds=getattr(cfg, "pool_prune_interval_seconds", 30),
+                health_check_url=getattr(cfg, "pool_health_url", cfg.validation_url),
+                enable_recheck=True,
+            )
         )
-        pool_server.start()
-    except OSError as e:
-        logger.error("pool: failed to start on %s:%s (%s). Is the port in use?", cfg.pool_host, cfg.pool_port, e)
-        return 1
+        pool_mgr.start()
+        ingest_t = threading.Thread(target=pool_ingest_loop, name="pool-ingest", args=(stop_thread, pool_q, pool_mgr), daemon=True)
+        ingest_t.start()
     except Exception as e:
-        logger.exception("pool: failed to start: %s", e)
+        logger.exception("pool: failed to start PoolManager: %s", e)
         return 1
 
     # Spawn a single producer child process (scrape+validate loop)
     producer = mp.Process(
         target=produce_process_loop,
-        args=(stop_proc, cfg, status_q),
+        args=(stop_proc, cfg, status_q, pool_q),
         name="producer-proc",
         daemon=True,
     )
-    # Start proxy supervisor in a thread (which launches proxy.py subprocess)
+    # Start proxy supervisor in a thread (launches mubeng subprocess)
     proxy_t = threading.Thread(
-        target=proxy_server_loop,
+        target=mubeng_server_loop,
         name="proxy",
         args=(stop_thread, cfg, status_q),
         daemon=True,
@@ -204,8 +207,8 @@ def main() -> int:
     except Exception:
         pass
     try:
-        if pool_server is not None:
-            pool_server.stop()
+        if 'pool_mgr' in locals() and pool_mgr is not None:
+            pool_mgr.stop()
     except Exception:
         pass
 

@@ -77,6 +77,7 @@ class Health:
     publish_flush_count: int = 0
     last_publish_count: int = 0
     pool_url: str = ""
+    pool_file: str = ""
 
 
 def status_consumer(status_q, health: "Health", stop_evt: threading.Event) -> None:
@@ -150,6 +151,8 @@ def status_consumer(status_q, health: "Health", stop_evt: threading.Event) -> No
                     health.output_dir = str(evt.get("output_dir"))
                 if evt.get("pool_url"):
                     health.pool_url = str(evt.get("pool_url"))
+                if evt.get("pool_file"):
+                    health.pool_file = str(evt.get("pool_file"))
             # Other event types are informational
 
 
@@ -157,15 +160,17 @@ def status_ticker(health: "Health", stop_evt: threading.Event, interval_s: float
     if interval_s <= 0:
         return
 
-    def _get_pool_size(url: str) -> int:
-        if not url:
+    def _get_pool_file_size(path: str) -> int:
+        if not path:
             return -1
         try:
-            from urllib.request import urlopen
-            with urlopen(url.rstrip("/") + "/pool", timeout=0.3) as resp:
-                data = resp.read().decode("utf-8", errors="replace")
-            # Count non-empty, non-comment lines
-            return sum(1 for ln in data.splitlines() if ln.strip() and not ln.lstrip().startswith("#"))
+            with open(path, "r", encoding="utf-8") as f:
+                count = 0
+                for ln in f:
+                    s = ln.strip()
+                    if s and not s.lstrip().startswith("#"):
+                        count += 1
+                return count
         except Exception:
             return -1
 
@@ -191,9 +196,9 @@ def status_ticker(health: "Health", stop_evt: threading.Event, interval_s: float
             pid = health.proxy_pid
             running = health.proxy_running
             restarts = health.proxy_restarts
-            pool_url = health.pool_url
+            pool_file = health.pool_file
 
-        pool_size = _get_pool_size(pool_url) if pool_url else -1
+        pool_size = _get_pool_file_size(pool_file) if pool_file else -1
         since_pub = humanize_duration(time.time() - last_pub_ts) if last_pub_ts else "never"
         last_file_size_str = humanize_bytes(pub_file_size) if pub_file_size else "0B"
         total_pub_str = humanize_bytes(publish_bytes_total) if publish_bytes_total else "0B"
