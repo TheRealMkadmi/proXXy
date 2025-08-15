@@ -4,6 +4,7 @@ import sys
 import threading
 import time
 import socket
+import ssl
 from urllib.parse import urlparse
 from typing import Iterable, List, Optional, Set, Tuple, Dict, Any, Callable
 
@@ -49,6 +50,66 @@ _RECHECK_READ_SECONDS = float(os.getenv("PROXXY_VALIDATOR_RECHECK_READ_SECONDS",
 _MIN_BPS = int(os.getenv("PROXXY_VALIDATOR_MIN_BPS", "16384"))
 # Require HTTP/1.1 response on validated fetch (some HTTP/1.0 paths are flaky)
 _REQUIRE_HTTP11 = os.getenv("PROXXY_VALIDATOR_REQUIRE_HTTP11", "1")
+# OS trust TLS preflight via system CA store (replicates Schannel/curl behavior)
+_OS_TRUST_PREFLIGHT = os.getenv("PROXXY_VALIDATOR_OS_TRUST_PREFLIGHT", "1")
+
+def _os_trust_tls_preflight(proxy: str, url: str) -> Tuple[bool, str]:
+    """
+    Perform an OS-trust TLS preflight through the proxy using CONNECT to the target host.
+    - Uses Windows/macOS OS trust via ssl.create_default_context + load_default_certs.
+    - Fails when certificate chain is not trusted by OS (e.g., MITM or bad chain), mirroring curl/Schannel behavior.
+    Returns (ok, error_string)
+    """
+    try:
+        u = urlparse(url)
+        target_host = u.hostname or ""
+        target_port = u.port or 443
+        pu = urlparse(proxy)
+        proxy_host = pu.hostname or ""
+        proxy_port = pu.port or (443 if (pu.scheme or "").lower() == "https" else 80)
+        if not target_host or not proxy_host or not proxy_port:
+            return False, "bad_host"
+
+        with socket.create_connection((proxy_host, int(proxy_port)), timeout=min(_CONNECT_TIMEOUT_SECONDS, _ENFORCED_TIMEOUT_SECONDS, 5.0)) as sock:
+            sock.settimeout(min(_ENFORCED_TIMEOUT_SECONDS, 5.0))
+            # Issue CONNECT
+            req = f"CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\nProxy-Connection: Keep-Alive\r\n\r\n"
+            sock.sendall(req.encode("ascii", "strict"))
+            # Read headers
+            buff = b""
+            while b"\r\n\r\n" not in buff and len(buff) < 8192:
+                chunk = sock.recv(1024)
+                if not chunk:
+                    break
+                buff += chunk
+            line = buff.split(b"\r\n", 1)[0] if buff else b""
+            if not line.startswith(b"HTTP/1.1 200") and not line.startswith(b"HTTP/1.0 200"):
+                return False, f"connect_resp:{line.decode('latin1', 'ignore')[:128]}"
+
+            # TLS handshake with OS trust (Windows Schannel equivalent)
+            ctx = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
+            try:
+                ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            except Exception:
+                pass
+            try:
+                # Ensure OS roots loaded (on Windows loads from Windows cert store)
+                ctx.load_default_certs(ssl.Purpose.SERVER_AUTH)
+            except Exception:
+                pass
+
+            with ctx.wrap_socket(sock, server_hostname=target_host) as tls:
+                # Force handshake; will raise on untrusted roots/SAN mismatch
+                _ = tls.version()
+            return True, ""
+    except ssl.SSLCertVerificationError as e:
+        # Mirror useful details when available
+        msg = getattr(e, "verify_message", str(e)) or str(e)
+        code = getattr(e, "verify_code", "")
+        code_s = f"{code}:" if code else ""
+        return False, f"tls_verify:{code_s}{msg}"
+    except Exception as e:
+        return False, f"tls_preflight:{str(e)[:256]}"
 
 def _get_session(timeout: float, verify_ssl: bool, user_agent: Optional[str] = None) -> requests.Session:
     sess: Optional[requests.Session] = getattr(_thread_local, "session", None)
@@ -110,6 +171,13 @@ def _check_one_requests(
                     pass
     except Exception as e:
         return proxy, False, None, f"tcp_preflight:{e}", None, None
+
+    # OS trust TLS preflight (detect untrusted cert chains akin to curl/Schannel)
+    if (_OS_TRUST_PREFLIGHT or "1") and str(_OS_TRUST_PREFLIGHT).strip().lower() not in ("0", "false", "no", "off"):
+        ok_tls, tls_err = _os_trust_tls_preflight(proxies.get("http") or proxy, url)
+        if not ok_tls:
+            return proxy, False, None, f"os_trust:{tls_err}", None, None
+
     try:
         t0 = time.monotonic()
         resp = sess.get(
