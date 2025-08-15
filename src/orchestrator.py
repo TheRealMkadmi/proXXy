@@ -294,8 +294,8 @@ def mubeng_server_loop(stop: threading.Event, config: Optional[OrchestratorConfi
     min_upstreams = max(0, int(getattr(cfg, "min_upstreams", 1)))
     simulate = os.environ.get("PROXXY_PROXY_SIMULATE", "0").lower() not in ("0", "false", "no")
     
-    # Build base command
-    cmd = [mubeng_bin, "-l", f"{host}:{port}", "-f", pool_file, "-w"]
+    # Build base command (mubeng expects --address/-a, not -l)
+    cmd = [mubeng_bin, "-a", f"{host}:{port}", "-f", pool_file, "-w"]
     # Append extra flags if provided
     if mubeng_extra:
         try:
