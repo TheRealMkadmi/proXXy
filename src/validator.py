@@ -28,6 +28,9 @@ OnResultFn = Callable[[Dict[str, Any]], None]
 _MIN_BYTES = int(os.getenv("PROXXY_VALIDATOR_MIN_BYTES", "1"))
 
 
+# Enforced per-request timeout (seconds) applied to all proxy validations
+_ENFORCED_TIMEOUT_SECONDS = 25.0
+
 def _get_session(timeout: float, verify_ssl: bool, user_agent: Optional[str] = None) -> requests.Session:
     sess: Optional[requests.Session] = getattr(_thread_local, "session", None)
     if sess is not None:
@@ -52,8 +55,8 @@ def _get_session(timeout: float, verify_ssl: bool, user_agent: Optional[str] = N
     )
     if user_agent:
         sess.headers["User-Agent"] = user_agent
-    # Store timeout default on the session via a simple attribute for reuse
-    sess.request_timeout = timeout  # type: ignore[attr-defined]
+    # Store enforced per-request timeout (connect, read) on the session
+    sess.request_timeout = (_ENFORCED_TIMEOUT_SECONDS, _ENFORCED_TIMEOUT_SECONDS)  # type: ignore[attr-defined]
     _thread_local.session = sess
     return sess
 
@@ -74,7 +77,7 @@ def _check_one_requests(
         resp = sess.get(
             url,
             proxies=proxies,
-            timeout=getattr(sess, "request_timeout", timeout),
+            timeout=getattr(sess, "request_timeout", (_ENFORCED_TIMEOUT_SECONDS, _ENFORCED_TIMEOUT_SECONDS)),
             stream=False,
             allow_redirects=True,
         )
