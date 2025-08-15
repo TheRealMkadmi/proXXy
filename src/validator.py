@@ -24,6 +24,9 @@ _thread_local = threading.local()
 OnLiveFn = Callable[[str, Dict[str, Any]], None]
 OnResultFn = Callable[[Dict[str, Any]], None]
 
+# Minimal downloaded bytes to consider success (default 1; tune via env)
+_MIN_BYTES = int(os.getenv("PROXXY_VALIDATOR_MIN_BYTES", "1"))
+
 
 def _get_session(timeout: float, verify_ssl: bool, user_agent: Optional[str] = None) -> requests.Session:
     sess: Optional[requests.Session] = getattr(_thread_local, "session", None)
@@ -38,6 +41,7 @@ def _get_session(timeout: float, verify_ssl: bool, user_agent: Optional[str] = N
     )
     sess.mount("http://", adapter)
     sess.mount("https://", adapter)
+    # Honor verify flag to enforce TLS verification
     sess.verify = verify_ssl
     sess.headers.update(
         {
@@ -54,12 +58,14 @@ def _get_session(timeout: float, verify_ssl: bool, user_agent: Optional[str] = N
     return sess
 
 
-def _check_one(
+def _check_one_requests(
     proxy: str, url: str, timeout: float, verify_ssl: bool, user_agent: Optional[str]
 ) -> Tuple[str, bool, Optional[int], Optional[str], Optional[float], Optional[str]]:
     """
-    Minimal validator: fetch the target URL fully via the proxy.
-    Success = 2xx/3xx status and full body read with no exceptions.
+    Validate via Python Requests (certifi/system depending on env).
+    Success when:
+    - HTTP status is 2xx/3xx
+    - Downloaded body size >= _MIN_BYTES
     """
     sess = _get_session(timeout, verify_ssl, user_agent)
     proxies = {"http": proxy, "https": proxy}
@@ -72,8 +78,8 @@ def _check_one(
             stream=False,
             allow_redirects=True,
         )
-        body = resp.content
-        ok = (200 <= resp.status_code < 400) and bool(body)
+        body = resp.content or b""
+        ok = (200 <= resp.status_code < 400) and (len(body) >= max(1, _MIN_BYTES))
         try:
             elapsed = float(resp.elapsed.total_seconds()) if resp.elapsed is not None else None
         except Exception:
@@ -81,10 +87,18 @@ def _check_one(
         if elapsed is None:
             elapsed = time.monotonic() - t0
         final_url = resp.url
+        status = resp.status_code
         resp.close()
-        return proxy, ok, resp.status_code, None, elapsed, final_url
+        return proxy, ok, status, None if ok else f"http={status} bytes={len(body)}", elapsed, final_url
     except Exception as e:
         return proxy, False, None, str(e), None, None
+
+
+def _check_one(
+    proxy: str, url: str, timeout: float, verify_ssl: bool, user_agent: Optional[str]
+) -> Tuple[str, bool, Optional[int], Optional[str], Optional[float], Optional[str]]:
+    # Single implementation: Requests only
+    return _check_one_requests(proxy, url, timeout, verify_ssl, user_agent)
 
 
 def check_proxies(
@@ -115,10 +129,11 @@ def check_proxies(
                 return item
         return None
 
-    with futures.ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="proxychk") as ex:
+    max_workers = max(1, int(workers))
+    with futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="proxychk") as ex:
         inflight: Set[futures.Future] = set()
         prox_iter = iter(proxies)
-        while len(inflight) < workers:
+        while len(inflight) < max_workers:
             nxt = _next_unique(prox_iter)
             if nxt is None:
                 break
@@ -205,7 +220,7 @@ def check_proxies_stream(
 ) -> Tuple[List[str], List[Dict[str, Any]]]:
     """
     Streaming validation. Invokes on_live for each success.
-    Success = full index page fetched with 2xx/3xx.
+    Success = 2xx/3xx AND at least _MIN_BYTES bytes downloaded.
     """
     seen: Set[str] = set()
     results: List[Dict[str, Any]] = []
@@ -228,10 +243,11 @@ def check_proxies_stream(
     else:
         should_stop = lambda: False
 
-    with futures.ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="proxychk") as ex:
+    max_workers = max(1, int(workers))
+    with futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="proxychk") as ex:
         inflight: Set[futures.Future] = set()
         prox_iter = iter(proxies)
-        while len(inflight) < workers and not should_stop():
+        while len(inflight) < max_workers and not should_stop():
             nxt = _next_unique(prox_iter)
             if nxt is None:
                 break
