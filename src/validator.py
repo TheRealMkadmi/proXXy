@@ -9,7 +9,6 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 from loguru import logger
-import subprocess
 
 # Configure loguru level from env (defaults to INFO)
 _LOG_LEVEL = os.getenv("PROXXY_VALIDATOR_LOG_LEVEL", os.getenv("PROXXY_LOG_LEVEL", "INFO"))
@@ -18,51 +17,6 @@ try:
 except Exception:
     pass
 logger.add(sys.stderr, level=_LOG_LEVEL, backtrace=False, diagnose=False, enqueue=True)
-
-# Validator backend selection: "requests" (default) or "curl" (uses system curl, e.g., Schannel on Windows)
-_VALIDATOR_BACKEND = os.getenv("PROXXY_VALIDATOR_BACKEND", "requests").strip().lower()
-
-def _check_one_curl(
-    proxy: str, url: str, timeout: float, verify_ssl: bool, user_agent: Optional[str]
-) -> Tuple[str, bool, Optional[int], Optional[str], Optional[float], Optional[str]]:
-    """
-    Validate a proxy using system curl to align TLS trust with the OS (e.g., Schannel on Windows).
-    Returns tuple compatible with _check_one.
-    """
-    curl_bin = os.environ.get("CURL_BIN", "curl")
-    # Build command: strict TLS (no -k), follow redirects, HEAD only
-    cmd = [
-        curl_bin,
-        "-x", proxy,
-        "-fsS",
-        "-I",
-        "-L",
-        "--connect-timeout", str(int(max(1, timeout))),
-        "--max-time", str(int(max(2, timeout + 2))),
-        url,
-    ]
-    if user_agent:
-        # Add UA header if provided
-        cmd.insert(-1, "-H")
-        cmd.insert(-1, f"User-Agent: {user_agent}")
-    t0 = time.monotonic()
-    try:
-        cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        elapsed = time.monotonic() - t0
-        out = ((cp.stdout or "") + "\n" + (cp.stderr or "")).strip()
-        # Parse last HTTP status line
-        status = None
-        for line in out.splitlines():
-            s = line.strip()
-            if s.upper().startswith("HTTP/"):
-                parts = s.split()
-                if len(parts) >= 2 and parts[1].isdigit():
-                    status = int(parts[1])
-        ok = (cp.returncode == 0) and (status is not None) and (200 <= status < 400)
-        err = None if ok else (out[-512:] if out else f"curl rc={cp.returncode}")
-        return proxy, ok, status, err, elapsed, None
-    except Exception as e:
-        return proxy, False, None, str(e), None, None
 
 # Thread-local session for connection pooling without cross-thread sharing
 _thread_local = threading.local()
@@ -77,10 +31,9 @@ def _get_session(timeout: float, verify_ssl: bool, user_agent: Optional[str] = N
         return sess
 
     sess = requests.Session()
-    # Large pools to support high concurrency within a thread
     adapter = HTTPAdapter(
-        pool_connections=1024,
-        pool_maxsize=1024,
+        pool_connections=256,
+        pool_maxsize=256,
         max_retries=Retry(total=0, connect=0, read=0, redirect=0, backoff_factor=0),
     )
     sess.mount("http://", adapter)
@@ -101,50 +54,26 @@ def _get_session(timeout: float, verify_ssl: bool, user_agent: Optional[str] = N
     return sess
 
 
-def _normalize_proxy(line: str, default_scheme: str = "http") -> Optional[str]:
-    s = line.strip()
-    if not s or s.startswith("#"):
-        return None
-    # If scheme missing, prepend default
-    if "://" not in s:
-        s = f"{default_scheme}://{s}"
-    # Very light validation
-    if s.split("://", 1)[0] not in ("http", "https"):
-        return None
-    return s
-
-
 def _check_one(
     proxy: str, url: str, timeout: float, verify_ssl: bool, user_agent: Optional[str]
 ) -> Tuple[str, bool, Optional[int], Optional[str], Optional[float], Optional[str]]:
+    """
+    Minimal validator: fetch the target URL fully via the proxy.
+    Success = 2xx/3xx status and full body read with no exceptions.
+    """
     sess = _get_session(timeout, verify_ssl, user_agent)
     proxies = {"http": proxy, "https": proxy}
-    # Tunables to ensure stability rather than "first byte wins"
-    MIN_BYTES = int(os.getenv("PROXXY_VALIDATOR_MIN_BYTES", "4096"))
-    READ_WINDOW = float(os.getenv("PROXXY_VALIDATOR_READ_SECONDS", "2.0"))
     try:
         t0 = time.monotonic()
-        # Stream to avoid full downloads; follow redirects; bounded timeout
         resp = sess.get(
             url,
             proxies=proxies,
             timeout=getattr(sess, "request_timeout", timeout),
-            stream=True,
+            stream=False,
             allow_redirects=True,
         )
-        # Read until we either gather enough bytes or we spend the small time budget.
-        total = 0
-        t_start = time.monotonic()
-        for chunk in resp.iter_content(chunk_size=2048):
-            if not chunk:
-                break
-            total += len(chunk)
-            if total >= MIN_BYTES or (time.monotonic() - t_start) >= READ_WINDOW:
-                break
-        # Consider 2xx-3xx OK and require a minimum payload fraction to reject early-canceling tunnels.
-        ok = (200 <= resp.status_code < 400) and (total >= max(1, MIN_BYTES // 4))
-        # Prefer server-reported elapsed if available, else fallback to measured
-        elapsed = None
+        body = resp.content
+        ok = (200 <= resp.status_code < 400) and bool(body)
         try:
             elapsed = float(resp.elapsed.total_seconds()) if resp.elapsed is not None else None
         except Exception:
@@ -186,21 +115,18 @@ def check_proxies(
                 return item
         return None
 
-    check_fn = _check_one_curl if _VALIDATOR_BACKEND == "curl" else _check_one
     with futures.ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="proxychk") as ex:
         inflight: Set[futures.Future] = set()
         prox_iter = iter(proxies)
-        # Prime the pump up to workers
         while len(inflight) < workers:
             nxt = _next_unique(prox_iter)
             if nxt is None:
                 break
-            inflight.add(ex.submit(check_fn, nxt, url, timeout, verify_ssl, user_agent))
+            inflight.add(ex.submit(_check_one, nxt, url, timeout, verify_ssl, user_agent))
             submitted += 1
             if len(inflight) > peak_inflight:
                 peak_inflight = len(inflight)
 
-        # Process and keep submitting as we go
         while inflight:
             done, _ = futures.wait(inflight, return_when=futures.FIRST_COMPLETED)
             for fut in done:
@@ -219,15 +145,13 @@ def check_proxies(
                     successes += 1
                 else:
                     logger.debug("failed: proxy={} err={}", proxy, err)
-                # Try to submit next task to maintain concurrency
                 nxt = _next_unique(prox_iter)
                 if nxt is not None:
-                    inflight.add(ex.submit(check_fn, nxt, url, timeout, verify_ssl, user_agent))
+                    inflight.add(ex.submit(_check_one, nxt, url, timeout, verify_ssl, user_agent))
                     submitted += 1
                     if len(inflight) > peak_inflight:
                         peak_inflight = len(inflight)
 
-                # Throttled progress logging
                 now = time.monotonic()
                 if now - last_log >= 1.0 or (total and completed and completed % 100 == 0):
                     elapsed_total = max(1e-6, time.time() - start)
@@ -254,10 +178,8 @@ def check_proxies(
                     last_log = now
 
     elapsed_total = time.time() - start
-    # Sort live by fastest first (None elapsed pushed to end)
     results.sort(key=lambda r: (float("inf") if r.get("elapsed") is None else r["elapsed"]))
     live_sorted = [r["proxy"] for r in results]
-    # Optional stats to stderr
     logger.success(
         "done: checked={} live={} elapsed={:.1f}s peak_workers={} rate={:.1f}/s",
         len(seen),
@@ -282,9 +204,8 @@ def check_proxies_stream(
     stop_event: Optional[threading.Event] = None,
 ) -> Tuple[List[str], List[Dict[str, Any]]]:
     """
-    Streaming validation. Invokes on_live(proxy, details) immediately for each success.
-    Also invokes optional on_result(details) for every completed probe (success or failure).
-    Returns (live_list_sorted_by_latency, all_result_dicts) after completion or cancellation.
+    Streaming validation. Invokes on_live for each success.
+    Success = full index page fetched with 2xx/3xx.
     """
     seen: Set[str] = set()
     results: List[Dict[str, Any]] = []
@@ -294,7 +215,6 @@ def check_proxies_stream(
     last_log = time.monotonic()
     completed = 0
     successes = 0
-    live_out: List[str] = []
 
     def _next_unique(it) -> Optional[str]:
         for item in it:
@@ -303,29 +223,23 @@ def check_proxies_stream(
                 return item
         return None
 
-    # Determine stop predicate with None-check to satisfy type-checkers and runtime duck-typing
     if stop_event is not None:
         should_stop = stop_event.is_set  # type: ignore[attr-defined]
     else:
         should_stop = lambda: False
 
-    # Select validation backend per env: PROXXY_VALIDATOR_BACKEND
-    check_fn = _check_one_curl if _VALIDATOR_BACKEND == "curl" else _check_one
-
     with futures.ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="proxychk") as ex:
         inflight: Set[futures.Future] = set()
         prox_iter = iter(proxies)
-        # Prime the pump up to workers
         while len(inflight) < workers and not should_stop():
             nxt = _next_unique(prox_iter)
             if nxt is None:
                 break
-            inflight.add(ex.submit(check_fn, nxt, url, timeout, verify_ssl, user_agent))
+            inflight.add(ex.submit(_check_one, nxt, url, timeout, verify_ssl, user_agent))
             submitted += 1
             if len(inflight) > peak_inflight:
                 peak_inflight = len(inflight)
 
-        # Process and keep submitting as we go
         while inflight and not should_stop():
             done, _ = futures.wait(inflight, return_when=futures.FIRST_COMPLETED)
             for fut in done:
@@ -343,14 +257,11 @@ def check_proxies_stream(
                 }
 
                 if ok:
-                    # Emit live immediately
                     try:
                         on_live(proxy, details)
                     except Exception:
-                        # Do not let callbacks break the loop
                         pass
                     successes += 1
-                    # Collect to return a sorted list at end
                     results.append(
                         {
                             "proxy": proxy,
@@ -360,11 +271,7 @@ def check_proxies_stream(
                         }
                     )
                 else:
-                    # Keep failure info only if on_result requested
-                    if on_result is None:
-                        # Reduce memory footprint by skipping failures
-                        pass
-                    else:
+                    if on_result is not None:
                         results.append(
                             {
                                 "proxy": proxy,
@@ -381,15 +288,13 @@ def check_proxies_stream(
                     except Exception:
                         pass
 
-                # Try to submit next task to maintain concurrency
                 nxt = _next_unique(prox_iter)
                 if nxt is not None and not should_stop():
-                    inflight.add(ex.submit(check_fn, nxt, url, timeout, verify_ssl, user_agent))
+                    inflight.add(ex.submit(_check_one, nxt, url, timeout, verify_ssl, user_agent))
                     submitted += 1
                     if len(inflight) > peak_inflight:
                         peak_inflight = len(inflight)
 
-                # Throttled progress logging
                 now = time.monotonic()
                 if now - last_log >= 1.0 or (total and completed and completed % 100 == 0):
                     elapsed_total = max(1e-6, time.time() - start)
@@ -415,7 +320,6 @@ def check_proxies_stream(
                         )
                     last_log = now
 
-    # Sort successes by latency, extract proxies for return value
     results.sort(key=lambda r: (float("inf") if r.get("elapsed") is None else r["elapsed"]))
     live_out = [r["proxy"] for r in results if "proxy" in r and r.get("elapsed") is not None]
     elapsed_total = time.time() - start

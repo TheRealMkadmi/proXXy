@@ -11,7 +11,7 @@ class OrchestratorConfig:
     validation_url: str
     validator_workers: int
     validator_timeout: float
-    # Proxy (mubeng) listen config
+    # Proxy (rota) listen config
     proxy_host: str
     proxy_port: int
     proxy_log_level: str
@@ -19,7 +19,7 @@ class OrchestratorConfig:
     work_with_scheme_path: str
     # status ticker
     status_interval: int
-    # File-backed pool for mubeng (-f -w)
+    # File-backed pool for rota (-f -w)
     pool_file_path: str
     pool_debounce_ms: int
     # Pool maintenance
@@ -27,17 +27,17 @@ class OrchestratorConfig:
     pool_prune_interval_seconds: int
     # Pool health re-check
     pool_health_url: str | None
-    # Minimum upstream proxies required before starting mubeng
+    # Minimum upstream proxies required before starting rota
     min_upstreams: int
-    # Mubeng binary and optional extra flags
-    mubeng_bin: str
-    mubeng_extra: str
+    # Rota binary and optional extra flags
+    rota_bin: str
+    rota_extra: str
 
 
 def load_config_from_env() -> OrchestratorConfig:
     output_dir = os.environ.get("PROXXY_OUTPUT_DIR", "output")
-    validation_url = os.environ.get("PROXXY_VALIDATION_URL", "https://example.com")
-    validator_workers = int(os.environ.get("PROXXY_VALIDATOR_WORKERS", "32"))
+    validation_url = os.environ.get("PROXXY_VALIDATION_URL", "https://www.netflix.com/")
+    validator_workers = int(os.environ.get("PROXXY_VALIDATOR_WORKERS", "1024"))
     validator_timeout = float(os.environ.get("PROXXY_VALIDATOR_TIMEOUT", "5.0"))
 
     proxy_host = os.environ.get("PROXXY_PROXY_HOST", "127.0.0.1")
@@ -59,12 +59,12 @@ def load_config_from_env() -> OrchestratorConfig:
     pool_prune_interval_seconds = int(os.environ.get("PROXXY_POOL_PRUNE_INTERVAL_SECONDS", "30"))
     pool_health_url = os.environ.get("PROXXY_POOL_HEALTH_URL", validation_url)
     
-    # Minimum upstream proxies required before starting mubeng
+    # Minimum upstream proxies required before starting rota
     min_upstreams = int(os.environ.get("PROXXY_MIN_UPSTREAMS", "1"))
     
-    # Mubeng
-    mubeng_bin = os.environ.get("PROXXY_MUBENG_BIN", "mubeng")
-    mubeng_extra = os.environ.get("PROXXY_MUBENG_EXTRA", "")
+    # Rota
+    rota_bin = os.environ.get("PROXXY_ROTA_BIN", "rota")
+    rota_extra = os.environ.get("PROXXY_ROTA_EXTRA", "")
 
     return OrchestratorConfig(
         output_dir=output_dir,
@@ -82,6 +82,6 @@ def load_config_from_env() -> OrchestratorConfig:
         pool_prune_interval_seconds=pool_prune_interval_seconds,
         pool_health_url=pool_health_url,
         min_upstreams=min_upstreams,
-        mubeng_bin=mubeng_bin,
-        mubeng_extra=mubeng_extra,
+        rota_bin=rota_bin,
+        rota_extra=rota_extra,
     )

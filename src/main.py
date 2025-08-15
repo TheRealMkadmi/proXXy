@@ -12,7 +12,7 @@ import time
 from .config import OrchestratorConfig, load_config_from_env
 from .status import Health, status_consumer, status_ticker
 from .pool_manager import PoolManager, PoolManagerConfig, pool_ingest_loop
-from .orchestrator import produce_process_loop, mubeng_server_loop
+from .orchestrator import produce_process_loop, rota_server_loop
 
 logger = logging.getLogger("proXXy.main")
 if not logger.handlers:
@@ -29,7 +29,7 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     """
     ap = argparse.ArgumentParser(
         prog="proXXy",
-        description="Continuous proxy pipeline: scrape -> validate (stream) -> pool -> mubeng upstream rotation via file.",
+        description="Continuous proxy pipeline: scrape -> validate (stream) -> pool -> rota upstream rotation via file.",
     )
     # Only set values when flags are provided (no default), so env/defaults remain if omitted.
     ap.add_argument("--output-dir", dest="output_dir", help="Override PROXXY_OUTPUT_DIR")
@@ -41,21 +41,14 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--proxy-log-level", dest="proxy_log_level", help="Override PROXXY_PROXY_LOG_LEVEL (e.g., WARNING, INFO)")
     ap.add_argument("--status-interval", dest="status_interval", type=int, help="Override PROXXY_STATUS_INTERVAL_SECONDS")
 
-    # File-backed pool and mubeng overrides
+    # File-backed pool and rota overrides
     ap.add_argument("--pool-file", dest="pool_file", help="Override PROXXY_POOL_FILE (default ./proxies.txt)")
     ap.add_argument("--pool-debounce-ms", dest="pool_debounce_ms", type=int, help="Override PROXXY_POOL_DEBOUNCE_MS (default 150)")
     ap.add_argument("--pool-ttl-seconds", dest="pool_ttl_seconds", type=int, help="Override PROXXY_POOL_TTL_SECONDS (default 900)")
     ap.add_argument("--pool-prune-interval-seconds", dest="pool_prune_interval_seconds", type=int, help="Override PROXXY_POOL_PRUNE_INTERVAL_SECONDS (default 30)")
-    ap.add_argument("--pool-health-url", dest="pool_health_url", help="Override PROXXY_POOL_HEALTH_URL (default = validation URL)")
-    ap.add_argument("--mubeng-bin", dest="mubeng_bin", help="Override PROXXY_MUBENG_BIN (default 'mubeng')")
-    ap.add_argument("--mubeng-extra", dest="mubeng_extra", help="Override PROXXY_MUBENG_EXTRA (extra flags)")
-    ap.add_argument("--min-upstreams", "--min-proxies", dest="min_upstreams", type=int, help="Override PROXXY_MIN_UPSTREAMS (minimum upstream proxies required before starting mubeng)")
-    ap.add_argument(
-        "--validator-backend",
-        dest="validator_backend",
-        choices=["requests", "curl"],
-        help="Override PROXXY_VALIDATOR_BACKEND (validator TLS backend: requests or curl)"
-    )
+    
+    ap.add_argument("--rota-extra", dest="rota_extra", help="Override PROXXY_ROTA_EXTRA (extra flags)")
+    ap.add_argument("--min-upstreams", "--min-proxies", dest="min_upstreams", type=int, help="Override PROXXY_MIN_UPSTREAMS (minimum upstream proxies required before starting rota)")
     
     # Optional convenience flags
     ap.add_argument("--scraper-log-level", dest="scraper_log_level", help="Set PROXXY_SCRAPER_LOG_LEVEL for Scrapy logs")
@@ -69,7 +62,7 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--proxy-simulate",
         dest="proxy_simulate",
         choices=["0", "1"],
-        help="Set PROXXY_PROXY_SIMULATE (1 to simulate mubeng; no binary needed)",
+        help="Set PROXXY_PROXY_SIMULATE (1 to simulate rota; no binary needed)",
     )
     return ap.parse_args(argv)
 
@@ -86,16 +79,14 @@ def main() -> int:
         "proxy_port": "PROXXY_PROXY_PORT",
         "proxy_log_level": "PROXXY_PROXY_LOG_LEVEL",
         "status_interval": "PROXXY_STATUS_INTERVAL_SECONDS",
-        # File-backed pool + mubeng
+        # File-backed pool + rota
         "pool_file": "PROXXY_POOL_FILE",
         "pool_debounce_ms": "PROXXY_POOL_DEBOUNCE_MS",
         "pool_ttl_seconds": "PROXXY_POOL_TTL_SECONDS",
         "pool_prune_interval_seconds": "PROXXY_POOL_PRUNE_INTERVAL_SECONDS",
         "pool_health_url": "PROXXY_POOL_HEALTH_URL",
         "min_upstreams": "PROXXY_MIN_UPSTREAMS",
-        "validator_backend": "PROXXY_VALIDATOR_BACKEND",
-        "mubeng_bin": "PROXXY_MUBENG_BIN",
-        "mubeng_extra": "PROXXY_MUBENG_EXTRA",
+        "rota_extra": "PROXXY_ROTA_EXTRA",
         # Pass-through for dependent components
         "scraper_log_level": "PROXXY_SCRAPER_LOG_LEVEL",
         "proxy_capture_output": "PROXXY_PROXY_CAPTURE_OUTPUT",
@@ -105,6 +96,9 @@ def main() -> int:
         if hasattr(args, attr) and getattr(args, attr) is not None:
             os.environ[env_key] = str(getattr(args, attr))
 
+    # Unify URLs: if pool-health not provided, use validation URL
+    if not os.environ.get("PROXXY_POOL_HEALTH_URL") and os.environ.get("PROXXY_VALIDATION_URL"):
+        os.environ["PROXXY_POOL_HEALTH_URL"] = os.environ["PROXXY_VALIDATION_URL"]
     cfg = load_config_from_env()
     os.makedirs(cfg.output_dir, exist_ok=True)
 
@@ -180,9 +174,9 @@ def main() -> int:
         name="producer-proc",
         daemon=True,
     )
-    # Start proxy supervisor in a thread (launches mubeng subprocess)
+    # Start proxy supervisor in a thread (launches rota subprocess)
     proxy_t = threading.Thread(
-        target=mubeng_server_loop,
+        target=rota_server_loop,
         name="proxy",
         args=(stop_thread, cfg, status_q),
         daemon=True,
@@ -193,10 +187,10 @@ def main() -> int:
         ticker_t.start()
     producer.start()
 
-    # Wait for enough upstream proxies before starting mubeng (gate launch)
+    # Wait for enough upstream proxies before starting rota (gate launch)
     min_required = max(0, int(getattr(cfg, "min_upstreams", 1)))
     if min_required > 0:
-        logger.info("proxy: waiting for at least %d upstream proxies before starting mubeng...", min_required)
+        logger.info("proxy: waiting for at least %d upstream proxies before starting rota...", min_required)
     last_log = time.monotonic()
     while not stop_thread.is_set():
         if min_required <= 0:
@@ -210,7 +204,7 @@ def main() -> int:
             try:
                 logger.info(border)
                 logger.info("= PROXY READY: upstreams >= %d (have %d) =", min_required, ready)
-                logger.info("= Starting mubeng on %s:%d =", cfg.proxy_host, cfg.proxy_port)
+                logger.info("= Starting %s on %s:%d =", getattr(cfg, "rota_bin", "proxy"), cfg.proxy_host, cfg.proxy_port)
                 logger.info(border)
             except Exception:
                 pass
