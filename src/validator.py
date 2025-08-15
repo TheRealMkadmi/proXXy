@@ -45,6 +45,10 @@ _SECOND_URL = os.getenv("PROXXY_VALIDATOR_SECOND_URL", "").strip()
 _CONNECT_TIMEOUT_SECONDS = float(os.getenv("PROXXY_VALIDATOR_CONNECT_TIMEOUT", "3.0"))
 # Re-check (2nd pass) read window
 _RECHECK_READ_SECONDS = float(os.getenv("PROXXY_VALIDATOR_RECHECK_READ_SECONDS", "0.8"))
+# Minimum sustained throughput after first byte (bytes/sec)
+_MIN_BPS = int(os.getenv("PROXXY_VALIDATOR_MIN_BPS", "16384"))
+# Require HTTP/1.1 response on validated fetch (some HTTP/1.0 paths are flaky)
+_REQUIRE_HTTP11 = os.getenv("PROXXY_VALIDATOR_REQUIRE_HTTP11", "1")
 
 def _get_session(timeout: float, verify_ssl: bool, user_agent: Optional[str] = None) -> requests.Session:
     sess: Optional[requests.Session] = getattr(_thread_local, "session", None)
@@ -66,6 +70,7 @@ def _get_session(timeout: float, verify_ssl: bool, user_agent: Optional[str] = N
             "Accept": "*/*",
             "Accept-Encoding": "identity",
             "Connection": "keep-alive",
+            "Accept-Language": os.getenv("PROXXY_VALIDATOR_ACCEPT_LANGUAGE", "en-US,en;q=0.9"),
         }
     )
     if user_agent:
@@ -116,8 +121,12 @@ def _check_one_requests(
         )
         total = 0
         start_read = time.monotonic()
+        first_byte_at: Optional[float] = None
         seen_first = False
         read_error = False
+        # Capture a sample of response bytes for content signature checks
+        sample_buf = bytearray()
+        min_bytes = max(1, _MIN_BYTES)
         try:
             for chunk in resp.iter_content(chunk_size=max(1, _CHUNK_SIZE)):
                 now = time.monotonic()
@@ -131,13 +140,61 @@ def _check_one_requests(
                     continue
                 if not seen_first:
                     seen_first = True
+                    first_byte_at = now
                 total += len(chunk)
-                if total >= max(1, _MIN_BYTES) or (now - start_read) >= float(_READ_WINDOW_SECONDS):
+                # keep up to ~16KB sample for token checks
+                if len(sample_buf) < 16384:
+                    take = min(len(chunk), 16384 - len(sample_buf))
+                    sample_buf.extend(chunk[:take])
+                if total >= min_bytes or (now - start_read) >= float(_READ_WINDOW_SECONDS):
                     break
         except Exception:
             # treat read errors as failure
             read_error = True
-        ok = (200 <= resp.status_code < 400) and (total >= max(1, _MIN_BYTES)) and (not read_error)
+
+        # Status and header sanity
+        status_ok = 200 <= resp.status_code < 400
+        headers = {k.lower(): v for k, v in (resp.headers or {}).items()}
+        if 300 <= resp.status_code < 400 and "location" not in headers:
+            status_ok = False
+
+        # HTTP version check (when available)
+        version_ok = True
+        if (_REQUIRE_HTTP11 or "1") and str(_REQUIRE_HTTP11).strip().lower() not in ("0", "false", "no", "off"):
+            try:
+                ver = getattr(getattr(resp, "raw", None), "version", None)
+                # http.client uses 11 for HTTP/1.1 and 10 for HTTP/1.0
+                if isinstance(ver, int) and ver != 11:
+                    version_ok = False
+            except Exception:
+                # if unknown, don't fail solely on this
+                pass
+
+        # Throughput after first byte
+        speed_ok = True
+        if seen_first and first_byte_at is not None:
+            dur = max(1e-6, (time.monotonic() - first_byte_at))
+            bps = total / dur
+            if bps < max(1, _MIN_BPS):
+                speed_ok = False
+        else:
+            speed_ok = False
+
+        # Optional content signature checks
+        tokens_ok = True
+        try:
+            want = [t.strip().lower() for t in (os.getenv("PROXXY_VALIDATOR_BODY_CONTAINS", "") or "").split(",") if t.strip()]
+            if not want:
+                uhost = (url or "").lower()
+                if "netflix.com" in uhost:
+                    want = ["netflix"]
+            if want:
+                text = bytes(sample_buf).decode("utf-8", errors="ignore").lower()
+                tokens_ok = all(tok in text for tok in want)
+        except Exception:
+            tokens_ok = True  # don't fail solely on token parsing
+
+        ok = status_ok and (total >= min_bytes) and (not read_error) and speed_ok and version_ok and tokens_ok
         try:
             elapsed = float(resp.elapsed.total_seconds()) if resp.elapsed is not None else None
         except Exception:
@@ -171,8 +228,11 @@ def _check_one_requests(
                 )
                 total2 = 0
                 start2 = time.monotonic()
+                first2: Optional[float] = None
                 seen_first2 = False
                 read_error2 = False
+                sample2 = bytearray()
+                min_bytes2 = max(1, _MIN_BYTES)
                 for chunk in resp2.iter_content(chunk_size=max(1, _CHUNK_SIZE)):
                     now2 = time.monotonic()
                     # TTFB guard for second pass
@@ -185,10 +245,55 @@ def _check_one_requests(
                         continue
                     if not seen_first2:
                         seen_first2 = True
+                        first2 = now2
                     total2 += len(chunk)
-                    if total2 >= max(1, _MIN_BYTES) or (now2 - start2) >= float(_RECHECK_READ_SECONDS):
+                    if len(sample2) < 16384:
+                        t2 = min(len(chunk), 16384 - len(sample2))
+                        sample2.extend(chunk[:t2])
+                    if total2 >= min_bytes2 or (now2 - start2) >= float(_RECHECK_READ_SECONDS):
                         break
-                if not (200 <= resp2.status_code < 400 and total2 >= max(1, _MIN_BYTES) and (not read_error2)):
+
+                # Status and header sanity for second pass
+                status2_ok = 200 <= resp2.status_code < 400
+                h2 = {k.lower(): v for k, v in (resp2.headers or {}).items()}
+                if 300 <= resp2.status_code < 400 and "location" not in h2:
+                    status2_ok = False
+
+                # HTTP version check (when available)
+                version2_ok = True
+                if (_REQUIRE_HTTP11 or "1") and str(_REQUIRE_HTTP11).strip().lower() not in ("0", "false", "no", "off"):
+                    try:
+                        ver2 = getattr(getattr(resp2, "raw", None), "version", None)
+                        if isinstance(ver2, int) and ver2 != 11:
+                            version2_ok = False
+                    except Exception:
+                        pass
+
+                # Throughput after first byte
+                speed2_ok = True
+                if seen_first2 and first2 is not None:
+                    dur2 = max(1e-6, (time.monotonic() - first2))
+                    bps2 = total2 / dur2
+                    if bps2 < max(1, _MIN_BPS):
+                        speed2_ok = False
+                else:
+                    speed2_ok = False
+
+                # Optional content signature checks (second pass)
+                tokens2_ok = True
+                try:
+                    want2 = [t.strip().lower() for t in (os.getenv("PROXXY_VALIDATOR_BODY_CONTAINS", "") or "").split(",") if t.strip()]
+                    if not want2:
+                        uhost2 = (target2 or "").lower()
+                        if "netflix.com" in uhost2:
+                            want2 = ["netflix"]
+                    if want2:
+                        text2 = bytes(sample2).decode("utf-8", errors="ignore").lower()
+                        tokens2_ok = all(tok in text2 for tok in want2)
+                except Exception:
+                    tokens2_ok = True
+
+                if not (status2_ok and total2 >= min_bytes2 and (not read_error2) and speed2_ok and version2_ok and tokens2_ok):
                     ok = False
                 resp2.close()
                 try:
