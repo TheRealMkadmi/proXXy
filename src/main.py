@@ -59,6 +59,12 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["0", "1"],
         help="Set PROXXY_PROXY_CAPTURE_OUTPUT (1 to capture proxy.py stdout/stderr into main logs, 0 to suppress)",
     )
+    ap.add_argument(
+        "--proxy-simulate",
+        dest="proxy_simulate",
+        choices=["0", "1"],
+        help="Set PROXXY_PROXY_SIMULATE (1 to simulate mubeng; no binary needed)",
+    )
     return ap.parse_args(argv)
 
 
@@ -86,6 +92,7 @@ def main() -> int:
         # Pass-through for dependent components
         "scraper_log_level": "PROXXY_SCRAPER_LOG_LEVEL",
         "proxy_capture_output": "PROXXY_PROXY_CAPTURE_OUTPUT",
+        "proxy_simulate": "PROXXY_PROXY_SIMULATE",
     }
     for attr, env_key in cli_to_env.items():
         if hasattr(args, attr) and getattr(args, attr) is not None:

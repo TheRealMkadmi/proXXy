@@ -292,6 +292,7 @@ def mubeng_server_loop(stop: threading.Event, config: Optional[OrchestratorConfi
     mubeng_bin = getattr(cfg, "mubeng_bin", "mubeng") or "mubeng"
     mubeng_extra = (getattr(cfg, "mubeng_extra", "") or "").strip()
     min_upstreams = max(0, int(getattr(cfg, "min_upstreams", 1)))
+    simulate = os.environ.get("PROXXY_PROXY_SIMULATE", "0").lower() not in ("0", "false", "no")
     
     # Build base command
     cmd = [mubeng_bin, "-l", f"{host}:{port}", "-f", pool_file, "-w"]
@@ -317,11 +318,80 @@ def mubeng_server_loop(stop: threading.Event, config: Optional[OrchestratorConfi
         except Exception:
             return 0
 
+    def _pool_head(n: int = 10) -> str:
+        try:
+            with open(pool_file, "r", encoding="utf-8") as f:
+                out = []
+                for i, ln in enumerate(f):
+                    if i >= max(0, int(n)):
+                        break
+                    out.append(ln.rstrip())
+                return "\n".join(out)
+        except Exception:
+            return ""
+
+    # Simulated mode: do not launch mubeng; just announce and monitor file
+    if simulate:
+        if min_upstreams > 0:
+            while not stop.is_set():
+                have = _count_upstreams()
+                if have >= min_upstreams:
+                    border = "=" * 72
+                    logger.info(border)
+                    logger.info("= PROXY READY: upstreams >= %d (have %d) =", min_upstreams, have)
+                    logger.info("= Simulated start on %s:%d =", host, port)
+                    logger.info(border)
+                    break
+                try:
+                    emit({"type": "proxy_waiting", "have": int(have), "need": int(min_upstreams)})
+                except Exception:
+                    pass
+                stop.wait(1.0)
+            if stop.is_set():
+                return
+        emit({"type": "proxy_starting"})
+        try:
+            emit({"type": "proxy_started", "pid": int(os.getpid())})
+        except Exception:
+            emit({"type": "proxy_started"})
+        # Announce readiness once file has required entries
+        def _ready_watch_sim():
+            while not stop.is_set():
+                try:
+                    count = _count_upstreams()
+                    if count >= min_upstreams:
+                        logger.info("proxy: ready (simulated %s:%d; upstreams>=%d)", host, port, min_upstreams)
+                        try:
+                            emit({"type": "proxy_ready", "upstreams": int(count)})
+                        except Exception:
+                            pass
+                        return
+                except Exception:
+                    pass
+                stop.wait(0.5)
+        threading.Thread(target=_ready_watch_sim, name="proxy-ready-sim", daemon=True).start()
+        # Stream simple counters to console
+        def _sim_stream():
+            last = -1
+            while not stop.is_set():
+                cnt = _count_upstreams()
+                if cnt != last:
+                    logger.info("sim-mubeng: upstreams=%d file=%s", cnt, pool_file)
+                    last = cnt
+                stop.wait(1.0)
+        threading.Thread(target=_sim_stream, name="proxy-sim-stream", daemon=True).start()
+        # Hold until stop
+        while not stop.is_set():
+            stop.wait(0.5)
+        logger.info("proxy: stopped (simulated mubeng)")
+        return
+
     proc = None
     try:
         while not stop.is_set():
             try:
-                capture = os.environ.get("PROXXY_PROXY_CAPTURE_OUTPUT", "0").lower() not in ("0", "false", "no")
+                # Default to capturing stdout/stderr to stream mubeng output to console
+                capture = os.environ.get("PROXXY_PROXY_CAPTURE_OUTPUT", "1").lower() not in ("0", "false", "no")
                 stdout_target = subprocess.PIPE if capture else subprocess.DEVNULL
                 stderr_target = subprocess.PIPE if capture else subprocess.DEVNULL
                 text_mode = True if capture else False
@@ -381,7 +451,7 @@ def mubeng_server_loop(stop: threading.Event, config: Optional[OrchestratorConfi
                         except Exception:
                             pass
                     if proc.stdout:
-                        t_out = threading.Thread(target=_reader, args=(proc.stdout, "stdout", logging.DEBUG), name="mubeng-stdout", daemon=True)
+                        t_out = threading.Thread(target=_reader, args=(proc.stdout, "stdout", logging.INFO), name="mubeng-stdout", daemon=True)
                         t_out.start()
                         reader_threads.append(t_out)
                     if proc.stderr:
@@ -425,6 +495,19 @@ def mubeng_server_loop(stop: threading.Event, config: Optional[OrchestratorConfi
                 while not stop.is_set():
                     ret = proc.poll()
                     if ret is not None:
+                        try:
+                            code_int = int(ret)
+                        except Exception:
+                            code_int = 1
+                        if code_int == 2:
+                            # Treat exit code 2 as fatal; provide context and do not restart
+                            logger.error(
+                                "proxy: mubeng exited with code=2 (fatal). Command='%s'\nPool file head:\n%s",
+                                " ".join(shlex.quote(x) for x in cmd),
+                                _pool_head(10),
+                            )
+                            emit({"type": "proxy_exit", "code": int(code_int)})
+                            return
                         logger.error("proxy: mubeng exited code=%s; restarting in 5s", ret)
                         emit({"type": "proxy_exit", "code": int(ret)})
                         if stop.wait(5.0):
