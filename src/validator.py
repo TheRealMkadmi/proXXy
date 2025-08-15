@@ -27,7 +27,7 @@ OnLiveFn = Callable[[str, Dict[str, Any]], None]
 OnResultFn = Callable[[Dict[str, Any]], None]
 
 # Minimal downloaded bytes to consider success (default 1; tune via env)
-_MIN_BYTES = int(os.getenv("PROXXY_VALIDATOR_MIN_BYTES", "2048"))
+_MIN_BYTES = int(os.getenv("PROXXY_VALIDATOR_MIN_BYTES", "4096"))
 
 
 # Enforced per-request timeout (seconds) applied to all proxy validations
@@ -39,6 +39,8 @@ _CHUNK_SIZE = int(os.getenv("PROXXY_VALIDATOR_CHUNK_SIZE", "2048"))
 _TTFB_SECONDS = float(os.getenv("PROXXY_VALIDATOR_TTFB_SECONDS", "0.8"))
 _DEFAULT_UA = os.getenv("PROXXY_VALIDATOR_USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 _TCP_PREFLIGHT = os.getenv("PROXXY_VALIDATOR_TCP_PREFLIGHT", "1")
+# Optional second URL to improve stability testing (falls back to primary when unset)
+_SECOND_URL = os.getenv("PROXXY_VALIDATOR_SECOND_URL", "").strip()
 # Connection phase timeout (connect), kept <= enforced overall timeout
 _CONNECT_TIMEOUT_SECONDS = float(os.getenv("PROXXY_VALIDATOR_CONNECT_TIMEOUT", "3.0"))
 # Re-check (2nd pass) read window
@@ -115,11 +117,13 @@ def _check_one_requests(
         total = 0
         start_read = time.monotonic()
         seen_first = False
+        read_error = False
         try:
             for chunk in resp.iter_content(chunk_size=max(1, _CHUNK_SIZE)):
                 now = time.monotonic()
                 # TTFB guard: if no data within threshold, treat as failure
                 if not seen_first and (now - start_read) >= float(_TTFB_SECONDS):
+                    read_error = True
                     break
                 if not chunk:
                     if (now - start_read) >= float(_READ_WINDOW_SECONDS):
@@ -132,8 +136,8 @@ def _check_one_requests(
                     break
         except Exception:
             # treat read errors as failure
-            pass
-        ok = (200 <= resp.status_code < 400) and (total >= max(1, _MIN_BYTES))
+            read_error = True
+        ok = (200 <= resp.status_code < 400) and (total >= max(1, _MIN_BYTES)) and (not read_error)
         try:
             elapsed = float(resp.elapsed.total_seconds()) if resp.elapsed is not None else None
         except Exception:
@@ -146,21 +150,34 @@ def _check_one_requests(
 
         # Optional double-check to reduce false positives that die immediately after first success
         if ok and (os.getenv("PROXXY_VALIDATOR_DOUBLE_CHECK", "1").strip().lower() not in ("0", "false", "no", "off")):
+            target2 = _SECOND_URL or url
             try:
-                resp2 = sess.get(
-                    url,
+                # fresh session to ensure a new TCP connection path (avoid pooled reuse)
+                sess2 = requests.Session()
+                adapter2 = HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=Retry(total=0, connect=0, read=0, redirect=0, backoff_factor=0))
+                sess2.mount("http://", adapter2)
+                sess2.mount("https://", adapter2)
+                sess2.verify = sess.verify
+                sess2.headers.update(dict(sess.headers))
+                # propagate enforced timeout
+                sess2.request_timeout = getattr(sess, "request_timeout", (_ENFORCED_TIMEOUT_SECONDS, _ENFORCED_TIMEOUT_SECONDS))  # type: ignore[attr-defined]
+                resp2 = sess2.get(
+                    target2,
                     proxies=proxies,
-                    timeout=getattr(sess, "request_timeout", (_ENFORCED_TIMEOUT_SECONDS, _ENFORCED_TIMEOUT_SECONDS)),
+                    timeout=getattr(sess2, "request_timeout", (_ENFORCED_TIMEOUT_SECONDS, _ENFORCED_TIMEOUT_SECONDS)),
                     stream=True,
                     allow_redirects=True,
+                    headers={"Connection": "close"},
                 )
                 total2 = 0
                 start2 = time.monotonic()
                 seen_first2 = False
+                read_error2 = False
                 for chunk in resp2.iter_content(chunk_size=max(1, _CHUNK_SIZE)):
                     now2 = time.monotonic()
                     # TTFB guard for second pass
                     if not seen_first2 and (now2 - start2) >= float(_TTFB_SECONDS):
+                        read_error2 = True
                         break
                     if not chunk:
                         if (now2 - start2) >= float(_RECHECK_READ_SECONDS):
@@ -171,9 +188,13 @@ def _check_one_requests(
                     total2 += len(chunk)
                     if total2 >= max(1, _MIN_BYTES) or (now2 - start2) >= float(_RECHECK_READ_SECONDS):
                         break
-                if not (200 <= resp2.status_code < 400 and total2 >= max(1, _MIN_BYTES)):
+                if not (200 <= resp2.status_code < 400 and total2 >= max(1, _MIN_BYTES) and (not read_error2)):
                     ok = False
                 resp2.close()
+                try:
+                    sess2.close()
+                except Exception:
+                    pass
             except Exception:
                 ok = False
 
