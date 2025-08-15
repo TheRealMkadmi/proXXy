@@ -291,7 +291,8 @@ def mubeng_server_loop(stop: threading.Event, config: Optional[OrchestratorConfi
     pool_file = cfg.pool_file_path
     mubeng_bin = getattr(cfg, "mubeng_bin", "mubeng") or "mubeng"
     mubeng_extra = (getattr(cfg, "mubeng_extra", "") or "").strip()
-
+    min_upstreams = max(0, int(getattr(cfg, "min_upstreams", 1)))
+    
     # Build base command
     cmd = [mubeng_bin, "-l", f"{host}:{port}", "-f", pool_file, "-w"]
     # Append extra flags if provided
@@ -301,6 +302,20 @@ def mubeng_server_loop(stop: threading.Event, config: Optional[OrchestratorConfi
         except Exception:
             # Fallback: append raw string
             cmd.append(mubeng_extra)
+
+    def _count_upstreams() -> int:
+        try:
+            with open(pool_file, "r", encoding="utf-8") as f:
+                count = 0
+                for ln in f:
+                    s = ln.strip()
+                    if s and not s.lstrip().startswith("#"):
+                        count += 1
+                return count
+        except FileNotFoundError:
+            return 0
+        except Exception:
+            return 0
 
     proc = None
     try:
@@ -313,6 +328,28 @@ def mubeng_server_loop(stop: threading.Event, config: Optional[OrchestratorConfi
                 encoding = "utf-8" if capture else None
                 errors = "replace" if capture else None
                 bufsize = 1 if capture else 0
+
+                # Wait for enough upstream proxies before starting mubeng
+                if min_upstreams > 0:
+                    while not stop.is_set():
+                        have = _count_upstreams()
+                        if have >= min_upstreams:
+                            border = "=" * 72
+                            try:
+                                logger.info(border)
+                                logger.info("= PROXY READY: upstreams >= %d (have %d) =", min_upstreams, have)
+                                logger.info("= Starting mubeng on %s:%d =", host, port)
+                                logger.info(border)
+                            except Exception:
+                                pass
+                            break
+                        try:
+                            emit({"type": "proxy_waiting", "have": int(have), "need": int(min_upstreams)})
+                        except Exception:
+                            pass
+                        stop.wait(1.0)
+                    if stop.is_set():
+                        return
 
                 logger.debug("proxy: starting cmd=%s", " ".join(shlex.quote(x) for x in cmd))
                 emit({"type": "proxy_starting"})
@@ -368,8 +405,8 @@ def mubeng_server_loop(stop: threading.Event, config: Optional[OrchestratorConfi
                                         count += 1
                                         if count > 0:
                                             break
-                            if count > 0:
-                                logger.info("proxy: ready (mubeng %s:%d; upstreams>0)", host, port)
+                            if count >= min_upstreams:
+                                logger.info("proxy: ready (mubeng %s:%d; upstreams>=%d)", host, port, min_upstreams)
                                 try:
                                     emit({"type": "proxy_ready", "upstreams": int(count)})
                                 except Exception:

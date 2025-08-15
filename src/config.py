@@ -27,6 +27,8 @@ class OrchestratorConfig:
     pool_prune_interval_seconds: int
     # Pool health re-check
     pool_health_url: str | None
+    # Minimum upstream proxies required before starting mubeng
+    min_upstreams: int
     # Mubeng binary and optional extra flags
     mubeng_bin: str
     mubeng_extra: str
@@ -56,7 +58,10 @@ def load_config_from_env() -> OrchestratorConfig:
     pool_ttl_seconds = int(os.environ.get("PROXXY_POOL_TTL_SECONDS", "900"))  # 15 minutes
     pool_prune_interval_seconds = int(os.environ.get("PROXXY_POOL_PRUNE_INTERVAL_SECONDS", "30"))
     pool_health_url = os.environ.get("PROXXY_POOL_HEALTH_URL", validation_url)
-
+    
+    # Minimum upstream proxies required before starting mubeng
+    min_upstreams = int(os.environ.get("PROXXY_MIN_UPSTREAMS", "1"))
+    
     # Mubeng
     mubeng_bin = os.environ.get("PROXXY_MUBENG_BIN", "mubeng")
     mubeng_extra = os.environ.get("PROXXY_MUBENG_EXTRA", "")
@@ -76,6 +81,7 @@ def load_config_from_env() -> OrchestratorConfig:
         pool_ttl_seconds=pool_ttl_seconds,
         pool_prune_interval_seconds=pool_prune_interval_seconds,
         pool_health_url=pool_health_url,
+        min_upstreams=min_upstreams,
         mubeng_bin=mubeng_bin,
         mubeng_extra=mubeng_extra,
     )

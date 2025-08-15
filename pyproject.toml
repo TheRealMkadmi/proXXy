@@ -21,6 +21,3 @@ build-backend = "hatchling.build"
 
 [tool.uv]
 package = false
-
-[tool.uv.scripts]
-start = "python -m src.main"

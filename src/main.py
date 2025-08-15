@@ -49,7 +49,8 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--pool-health-url", dest="pool_health_url", help="Override PROXXY_POOL_HEALTH_URL (default = validation URL)")
     ap.add_argument("--mubeng-bin", dest="mubeng_bin", help="Override PROXXY_MUBENG_BIN (default 'mubeng')")
     ap.add_argument("--mubeng-extra", dest="mubeng_extra", help="Override PROXXY_MUBENG_EXTRA (extra flags)")
-
+    ap.add_argument("--min-upstreams", "--min-proxies", dest="min_upstreams", type=int, help="Override PROXXY_MIN_UPSTREAMS (minimum upstream proxies required before starting mubeng)")
+    
     # Optional convenience flags
     ap.add_argument("--scraper-log-level", dest="scraper_log_level", help="Set PROXXY_SCRAPER_LOG_LEVEL for Scrapy logs")
     ap.add_argument(
@@ -79,6 +80,7 @@ def main() -> int:
         "pool_ttl_seconds": "PROXXY_POOL_TTL_SECONDS",
         "pool_prune_interval_seconds": "PROXXY_POOL_PRUNE_INTERVAL_SECONDS",
         "pool_health_url": "PROXXY_POOL_HEALTH_URL",
+        "min_upstreams": "PROXXY_MIN_UPSTREAMS",
         "mubeng_bin": "PROXXY_MUBENG_BIN",
         "mubeng_extra": "PROXXY_MUBENG_EXTRA",
         # Pass-through for dependent components
@@ -176,7 +178,36 @@ def main() -> int:
     if ticker_interval > 0:
         ticker_t.start()
     producer.start()
-    proxy_t.start()
+
+    # Wait for enough upstream proxies before starting mubeng (gate launch)
+    min_required = max(0, int(getattr(cfg, "min_upstreams", 1)))
+    if min_required > 0:
+        logger.info("proxy: waiting for at least %d upstream proxies before starting mubeng...", min_required)
+    last_log = time.monotonic()
+    while not stop_thread.is_set():
+        if min_required <= 0:
+            break
+        try:
+            ready = int(pool_mgr.size() if pool_mgr is not None else 0)
+        except Exception:
+            ready = 0
+        if ready >= min_required:
+            border = "=" * 72
+            try:
+                logger.info(border)
+                logger.info("= PROXY READY: upstreams >= %d (have %d) =", min_required, ready)
+                logger.info("= Starting mubeng on %s:%d =", cfg.proxy_host, cfg.proxy_port)
+                logger.info(border)
+            except Exception:
+                pass
+            break
+        if (time.monotonic() - last_log) >= 2.0:
+            logger.info("proxy: upstreams %d/%d ready", ready, min_required)
+            last_log = time.monotonic()
+        time.sleep(0.5)
+
+    if not stop_thread.is_set():
+        proxy_t.start()
 
     try:
         while not stop_thread.is_set():
