@@ -125,6 +125,17 @@ class LivePool:
                 return []
             return list(self._list[: min(n, len(self._list))])
 
+    def latest(self, n: int) -> List[str]:
+        """
+        Return up to n proxies from the end of the list (newest by recency).
+        """
+        n = max(0, int(n))
+        with self._lock:
+            if n == 0 or not self._list:
+                return []
+            k = min(n, len(self._list))
+            return list(self._list[-k:])
+
     def prune_expired(self, ttl_seconds: float, now: Optional[float] = None) -> int:
         """
         Remove entries whose last_seen is older than now - ttl_seconds.
@@ -383,9 +394,15 @@ class PoolManager:
         health_url = self.cfg.health_check_url
         if not isinstance(health_url, str) or not health_url:
             return
-        while not self._stop_ev.wait(max(1, int(self.cfg.prune_interval_seconds))):
+        interval = float(os.getenv("PROXXY_POOL_RECHECK_INTERVAL_SECONDS", str(self.cfg.prune_interval_seconds)))
+        while not self._stop_ev.wait(max(0.2, interval)):
             try:
-                sample = self.pool.oldest(int(self.cfg.recheck_per_interval))
+                order = (os.getenv("PROXXY_POOL_RECHECK_ORDER", "newest") or "newest").strip().lower()
+                count = int(self.cfg.recheck_per_interval)
+                if order == "newest":
+                    sample = self.pool.latest(count)
+                else:
+                    sample = self.pool.oldest(count)
                 if not sample:
                     continue
                 sess = self._get_session()

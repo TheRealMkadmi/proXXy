@@ -46,6 +46,10 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--pool-debounce-ms", dest="pool_debounce_ms", type=int, help="Override PROXXY_POOL_DEBOUNCE_MS (default 150)")
     ap.add_argument("--pool-ttl-seconds", dest="pool_ttl_seconds", type=int, help="Override PROXXY_POOL_TTL_SECONDS (default 900)")
     ap.add_argument("--pool-prune-interval-seconds", dest="pool_prune_interval_seconds", type=int, help="Override PROXXY_POOL_PRUNE_INTERVAL_SECONDS (default 30)")
+    # Pool recheck aggressiveness
+    ap.add_argument("--pool-recheck-per-interval", dest="pool_recheck_per_interval", type=int, help="Override PROXXY_POOL_RECHECK_PER_INTERVAL (default 200)")
+    ap.add_argument("--pool-recheck-workers", dest="pool_recheck_workers", type=int, help="Override PROXXY_POOL_RECHECK_WORKERS (default 32)")
+    ap.add_argument("--pool-recheck-timeout", dest="pool_recheck_timeout", type=float, help="Override PROXXY_POOL_RECHECK_TIMEOUT (seconds, default 2.5)")
     
     ap.add_argument("--rota-extra", dest="rota_extra", help="Override PROXXY_ROTA_EXTRA (extra flags)")
     ap.add_argument("--min-upstreams", "--min-proxies", dest="min_upstreams", type=int, help="Override PROXXY_MIN_UPSTREAMS (minimum upstream proxies required before starting rota)")
@@ -85,6 +89,9 @@ def main() -> int:
         "pool_ttl_seconds": "PROXXY_POOL_TTL_SECONDS",
         "pool_prune_interval_seconds": "PROXXY_POOL_PRUNE_INTERVAL_SECONDS",
         "pool_health_url": "PROXXY_POOL_HEALTH_URL",
+        "pool_recheck_per_interval": "PROXXY_POOL_RECHECK_PER_INTERVAL",
+        "pool_recheck_workers": "PROXXY_POOL_RECHECK_WORKERS",
+        "pool_recheck_timeout": "PROXXY_POOL_RECHECK_TIMEOUT",
         "min_upstreams": "PROXXY_MIN_UPSTREAMS",
         "rota_extra": "PROXXY_ROTA_EXTRA",
         # Pass-through for dependent components
@@ -157,6 +164,9 @@ def main() -> int:
                 ttl_seconds=getattr(cfg, "pool_ttl_seconds", 900),
                 prune_interval_seconds=getattr(cfg, "pool_prune_interval_seconds", 30),
                 health_check_url=getattr(cfg, "pool_health_url", cfg.validation_url),
+                recheck_timeout=float(os.getenv("PROXXY_POOL_RECHECK_TIMEOUT", "2.5")),
+                recheck_per_interval=int(os.getenv("PROXXY_POOL_RECHECK_PER_INTERVAL", "200")),
+                recheck_workers=int(os.getenv("PROXXY_POOL_RECHECK_WORKERS", "32")),
                 enable_recheck=True,
             )
         )

@@ -3,6 +3,8 @@ import os
 import sys
 import threading
 import time
+import socket
+from urllib.parse import urlparse
 from typing import Iterable, List, Optional, Set, Tuple, Dict, Any, Callable
 
 import requests
@@ -36,6 +38,11 @@ _READ_WINDOW_SECONDS = float(os.getenv("PROXXY_VALIDATOR_READ_SECONDS", "1.0"))
 _CHUNK_SIZE = int(os.getenv("PROXXY_VALIDATOR_CHUNK_SIZE", "2048"))
 _TTFB_SECONDS = float(os.getenv("PROXXY_VALIDATOR_TTFB_SECONDS", "0.8"))
 _DEFAULT_UA = os.getenv("PROXXY_VALIDATOR_USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+_TCP_PREFLIGHT = os.getenv("PROXXY_VALIDATOR_TCP_PREFLIGHT", "1")
+# Connection phase timeout (connect), kept <= enforced overall timeout
+_CONNECT_TIMEOUT_SECONDS = float(os.getenv("PROXXY_VALIDATOR_CONNECT_TIMEOUT", "3.0"))
+# Re-check (2nd pass) read window
+_RECHECK_READ_SECONDS = float(os.getenv("PROXXY_VALIDATOR_RECHECK_READ_SECONDS", "0.8"))
 
 def _get_session(timeout: float, verify_ssl: bool, user_agent: Optional[str] = None) -> requests.Session:
     sess: Optional[requests.Session] = getattr(_thread_local, "session", None)
@@ -66,7 +73,7 @@ def _get_session(timeout: float, verify_ssl: bool, user_agent: Optional[str] = N
         if ua:
             sess.headers["User-Agent"] = ua
     # Store enforced per-request timeout (connect, read) on the session
-    sess.request_timeout = (_ENFORCED_TIMEOUT_SECONDS, _ENFORCED_TIMEOUT_SECONDS)  # type: ignore[attr-defined]
+    sess.request_timeout = (min(_CONNECT_TIMEOUT_SECONDS, _ENFORCED_TIMEOUT_SECONDS), _ENFORCED_TIMEOUT_SECONDS)  # type: ignore[attr-defined]
     _thread_local.session = sess
     return sess
 
@@ -82,6 +89,20 @@ def _check_one_requests(
     """
     sess = _get_session(timeout, verify_ssl, user_agent)
     proxies = {"http": proxy, "https": proxy}
+    # Optional TCP preflight to weed out proxies with closed or unresponsive ports quickly
+    try:
+        if (_TCP_PREFLIGHT or "1") and str(_TCP_PREFLIGHT).strip().lower() not in ("0", "false", "no", "off"):
+            u = urlparse(proxies.get("http") or proxy)
+            host = u.hostname
+            port = u.port or (443 if (u.scheme or "").lower() == "https" else 80)
+            if host and port:
+                s = socket.create_connection((host, int(port)), timeout=min(_CONNECT_TIMEOUT_SECONDS, _ENFORCED_TIMEOUT_SECONDS, 3.0))
+                try:
+                    s.close()
+                except Exception:
+                    pass
+    except Exception as e:
+        return proxy, False, None, f"tcp_preflight:{e}", None, None
     try:
         t0 = time.monotonic()
         resp = sess.get(
@@ -122,6 +143,40 @@ def _check_one_requests(
         final_url = resp.url
         status = resp.status_code
         resp.close()
+
+        # Optional double-check to reduce false positives that die immediately after first success
+        if ok and (os.getenv("PROXXY_VALIDATOR_DOUBLE_CHECK", "1").strip().lower() not in ("0", "false", "no", "off")):
+            try:
+                resp2 = sess.get(
+                    url,
+                    proxies=proxies,
+                    timeout=getattr(sess, "request_timeout", (_ENFORCED_TIMEOUT_SECONDS, _ENFORCED_TIMEOUT_SECONDS)),
+                    stream=True,
+                    allow_redirects=True,
+                )
+                total2 = 0
+                start2 = time.monotonic()
+                seen_first2 = False
+                for chunk in resp2.iter_content(chunk_size=max(1, _CHUNK_SIZE)):
+                    now2 = time.monotonic()
+                    # TTFB guard for second pass
+                    if not seen_first2 and (now2 - start2) >= float(_TTFB_SECONDS):
+                        break
+                    if not chunk:
+                        if (now2 - start2) >= float(_RECHECK_READ_SECONDS):
+                            break
+                        continue
+                    if not seen_first2:
+                        seen_first2 = True
+                    total2 += len(chunk)
+                    if total2 >= max(1, _MIN_BYTES) or (now2 - start2) >= float(_RECHECK_READ_SECONDS):
+                        break
+                if not (200 <= resp2.status_code < 400 and total2 >= max(1, _MIN_BYTES)):
+                    ok = False
+                resp2.close()
+            except Exception:
+                ok = False
+
         return proxy, ok, status, None if ok else f"http={status} bytes={total}", elapsed, final_url
     except Exception as e:
         return proxy, False, None, str(e), None, None
