@@ -9,6 +9,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 from loguru import logger
+import subprocess
 
 # Configure loguru level from env (defaults to INFO)
 _LOG_LEVEL = os.getenv("PROXXY_VALIDATOR_LOG_LEVEL", os.getenv("PROXXY_LOG_LEVEL", "INFO"))
@@ -17,6 +18,51 @@ try:
 except Exception:
     pass
 logger.add(sys.stderr, level=_LOG_LEVEL, backtrace=False, diagnose=False, enqueue=True)
+
+# Validator backend selection: "requests" (default) or "curl" (uses system curl, e.g., Schannel on Windows)
+_VALIDATOR_BACKEND = os.getenv("PROXXY_VALIDATOR_BACKEND", "requests").strip().lower()
+
+def _check_one_curl(
+    proxy: str, url: str, timeout: float, verify_ssl: bool, user_agent: Optional[str]
+) -> Tuple[str, bool, Optional[int], Optional[str], Optional[float], Optional[str]]:
+    """
+    Validate a proxy using system curl to align TLS trust with the OS (e.g., Schannel on Windows).
+    Returns tuple compatible with _check_one.
+    """
+    curl_bin = os.environ.get("CURL_BIN", "curl")
+    # Build command: strict TLS (no -k), follow redirects, HEAD only
+    cmd = [
+        curl_bin,
+        "-x", proxy,
+        "-fsS",
+        "-I",
+        "-L",
+        "--connect-timeout", str(int(max(1, timeout))),
+        "--max-time", str(int(max(2, timeout + 2))),
+        url,
+    ]
+    if user_agent:
+        # Add UA header if provided
+        cmd.insert(-1, "-H")
+        cmd.insert(-1, f"User-Agent: {user_agent}")
+    t0 = time.monotonic()
+    try:
+        cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        elapsed = time.monotonic() - t0
+        out = ((cp.stdout or "") + "\n" + (cp.stderr or "")).strip()
+        # Parse last HTTP status line
+        status = None
+        for line in out.splitlines():
+            s = line.strip()
+            if s.upper().startswith("HTTP/"):
+                parts = s.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    status = int(parts[1])
+        ok = (cp.returncode == 0) and (status is not None) and (200 <= status < 400)
+        err = None if ok else (out[-512:] if out else f"curl rc={cp.returncode}")
+        return proxy, ok, status, err, elapsed, None
+    except Exception as e:
+        return proxy, False, None, str(e), None, None
 
 # Thread-local session for connection pooling without cross-thread sharing
 _thread_local = threading.local()
@@ -140,6 +186,7 @@ def check_proxies(
                 return item
         return None
 
+    check_fn = _check_one_curl if _VALIDATOR_BACKEND == "curl" else _check_one
     with futures.ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="proxychk") as ex:
         inflight: Set[futures.Future] = set()
         prox_iter = iter(proxies)
@@ -148,7 +195,7 @@ def check_proxies(
             nxt = _next_unique(prox_iter)
             if nxt is None:
                 break
-            inflight.add(ex.submit(_check_one, nxt, url, timeout, verify_ssl, user_agent))
+            inflight.add(ex.submit(check_fn, nxt, url, timeout, verify_ssl, user_agent))
             submitted += 1
             if len(inflight) > peak_inflight:
                 peak_inflight = len(inflight)
@@ -175,7 +222,7 @@ def check_proxies(
                 # Try to submit next task to maintain concurrency
                 nxt = _next_unique(prox_iter)
                 if nxt is not None:
-                    inflight.add(ex.submit(_check_one, nxt, url, timeout, verify_ssl, user_agent))
+                    inflight.add(ex.submit(check_fn, nxt, url, timeout, verify_ssl, user_agent))
                     submitted += 1
                     if len(inflight) > peak_inflight:
                         peak_inflight = len(inflight)
@@ -262,6 +309,9 @@ def check_proxies_stream(
     else:
         should_stop = lambda: False
 
+    # Select validation backend per env: PROXXY_VALIDATOR_BACKEND
+    check_fn = _check_one_curl if _VALIDATOR_BACKEND == "curl" else _check_one
+
     with futures.ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="proxychk") as ex:
         inflight: Set[futures.Future] = set()
         prox_iter = iter(proxies)
@@ -270,7 +320,7 @@ def check_proxies_stream(
             nxt = _next_unique(prox_iter)
             if nxt is None:
                 break
-            inflight.add(ex.submit(_check_one, nxt, url, timeout, verify_ssl, user_agent))
+            inflight.add(ex.submit(check_fn, nxt, url, timeout, verify_ssl, user_agent))
             submitted += 1
             if len(inflight) > peak_inflight:
                 peak_inflight = len(inflight)
@@ -334,7 +384,7 @@ def check_proxies_stream(
                 # Try to submit next task to maintain concurrency
                 nxt = _next_unique(prox_iter)
                 if nxt is not None and not should_stop():
-                    inflight.add(ex.submit(_check_one, nxt, url, timeout, verify_ssl, user_agent))
+                    inflight.add(ex.submit(check_fn, nxt, url, timeout, verify_ssl, user_agent))
                     submitted += 1
                     if len(inflight) > peak_inflight:
                         peak_inflight = len(inflight)

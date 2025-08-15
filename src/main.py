@@ -50,6 +50,12 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--mubeng-bin", dest="mubeng_bin", help="Override PROXXY_MUBENG_BIN (default 'mubeng')")
     ap.add_argument("--mubeng-extra", dest="mubeng_extra", help="Override PROXXY_MUBENG_EXTRA (extra flags)")
     ap.add_argument("--min-upstreams", "--min-proxies", dest="min_upstreams", type=int, help="Override PROXXY_MIN_UPSTREAMS (minimum upstream proxies required before starting mubeng)")
+    ap.add_argument(
+        "--validator-backend",
+        dest="validator_backend",
+        choices=["requests", "curl"],
+        help="Override PROXXY_VALIDATOR_BACKEND (validator TLS backend: requests or curl)"
+    )
     
     # Optional convenience flags
     ap.add_argument("--scraper-log-level", dest="scraper_log_level", help="Set PROXXY_SCRAPER_LOG_LEVEL for Scrapy logs")
@@ -87,6 +93,7 @@ def main() -> int:
         "pool_prune_interval_seconds": "PROXXY_POOL_PRUNE_INTERVAL_SECONDS",
         "pool_health_url": "PROXXY_POOL_HEALTH_URL",
         "min_upstreams": "PROXXY_MIN_UPSTREAMS",
+        "validator_backend": "PROXXY_VALIDATOR_BACKEND",
         "mubeng_bin": "PROXXY_MUBENG_BIN",
         "mubeng_extra": "PROXXY_MUBENG_EXTRA",
         # Pass-through for dependent components
