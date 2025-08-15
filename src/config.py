@@ -60,7 +60,7 @@ def load_config_from_env() -> OrchestratorConfig:
     pool_health_url = os.environ.get("PROXXY_POOL_HEALTH_URL", validation_url)
     
     # Minimum upstream proxies required before starting rota
-    min_upstreams = int(os.environ.get("PROXXY_MIN_UPSTREAMS", "1"))
+    min_upstreams = int(os.environ.get("PROXXY_MIN_UPSTREAMS", "10"))
     
     # Rota
     rota_bin = os.environ.get("PROXXY_ROTA_BIN", "rota")

@@ -25,11 +25,17 @@ OnLiveFn = Callable[[str, Dict[str, Any]], None]
 OnResultFn = Callable[[Dict[str, Any]], None]
 
 # Minimal downloaded bytes to consider success (default 1; tune via env)
-_MIN_BYTES = int(os.getenv("PROXXY_VALIDATOR_MIN_BYTES", "1"))
+_MIN_BYTES = int(os.getenv("PROXXY_VALIDATOR_MIN_BYTES", "2048"))
 
 
 # Enforced per-request timeout (seconds) applied to all proxy validations
 _ENFORCED_TIMEOUT_SECONDS = 25.0
+
+# Aggressive streaming reader tunables
+_READ_WINDOW_SECONDS = float(os.getenv("PROXXY_VALIDATOR_READ_SECONDS", "1.0"))
+_CHUNK_SIZE = int(os.getenv("PROXXY_VALIDATOR_CHUNK_SIZE", "2048"))
+_TTFB_SECONDS = float(os.getenv("PROXXY_VALIDATOR_TTFB_SECONDS", "0.8"))
+_DEFAULT_UA = os.getenv("PROXXY_VALIDATOR_USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
 def _get_session(timeout: float, verify_ssl: bool, user_agent: Optional[str] = None) -> requests.Session:
     sess: Optional[requests.Session] = getattr(_thread_local, "session", None)
@@ -55,6 +61,10 @@ def _get_session(timeout: float, verify_ssl: bool, user_agent: Optional[str] = N
     )
     if user_agent:
         sess.headers["User-Agent"] = user_agent
+    else:
+        ua = os.getenv("PROXXY_VALIDATOR_USER_AGENT", _DEFAULT_UA)
+        if ua:
+            sess.headers["User-Agent"] = ua
     # Store enforced per-request timeout (connect, read) on the session
     sess.request_timeout = (_ENFORCED_TIMEOUT_SECONDS, _ENFORCED_TIMEOUT_SECONDS)  # type: ignore[attr-defined]
     _thread_local.session = sess
@@ -78,11 +88,31 @@ def _check_one_requests(
             url,
             proxies=proxies,
             timeout=getattr(sess, "request_timeout", (_ENFORCED_TIMEOUT_SECONDS, _ENFORCED_TIMEOUT_SECONDS)),
-            stream=False,
+            stream=True,
             allow_redirects=True,
         )
-        body = resp.content or b""
-        ok = (200 <= resp.status_code < 400) and (len(body) >= max(1, _MIN_BYTES))
+        total = 0
+        start_read = time.monotonic()
+        seen_first = False
+        try:
+            for chunk in resp.iter_content(chunk_size=max(1, _CHUNK_SIZE)):
+                now = time.monotonic()
+                # TTFB guard: if no data within threshold, treat as failure
+                if not seen_first and (now - start_read) >= float(_TTFB_SECONDS):
+                    break
+                if not chunk:
+                    if (now - start_read) >= float(_READ_WINDOW_SECONDS):
+                        break
+                    continue
+                if not seen_first:
+                    seen_first = True
+                total += len(chunk)
+                if total >= max(1, _MIN_BYTES) or (now - start_read) >= float(_READ_WINDOW_SECONDS):
+                    break
+        except Exception:
+            # treat read errors as failure
+            pass
+        ok = (200 <= resp.status_code < 400) and (total >= max(1, _MIN_BYTES))
         try:
             elapsed = float(resp.elapsed.total_seconds()) if resp.elapsed is not None else None
         except Exception:
@@ -92,7 +122,7 @@ def _check_one_requests(
         final_url = resp.url
         status = resp.status_code
         resp.close()
-        return proxy, ok, status, None if ok else f"http={status} bytes={len(body)}", elapsed, final_url
+        return proxy, ok, status, None if ok else f"http={status} bytes={total}", elapsed, final_url
     except Exception as e:
         return proxy, False, None, str(e), None, None
 
