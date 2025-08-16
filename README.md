@@ -116,3 +116,43 @@ If you like what I do, buy me boba so I can continue developing this tool and ot
 ## License
 
 This project is licensed under the GNU General Public License v3.0 License. See the `LICENSE` file for more information.
+
+## HTTP/2 validator (strict) — end-to-end H2 required
+
+The validator now requires proxies to pass a real HTTP/2 fetch to the target URL before they are admitted to the pool. This prevents enabling proxies that later fail curl with “HTTP/2 stream was not closed cleanly: CANCEL (err 8)”.
+
+Implementation details
+- Code: see [src/validator.py](src/validator.py) and the new [def _check_one_http2()](src/validator.py:680).
+- TLS preflight: [def _os_trust_tls_preflight()](src/validator.py:59) performs CONNECT + OS-trust TLS handshake and enforces ALPN “h2” when strict mode is on.
+- Dependency: httpx with HTTP/2 support (declared in [pyproject.toml](pyproject.toml)).
+
+Defaults (can be overridden via environment)
+- PROXXY_VALIDATOR_HTTP2_ENABLE=1
+  - Attempt HTTP/2 validation for HTTPS targets.
+- PROXXY_VALIDATOR_HTTP2_REQUIRED=1
+  - Strict mode: fail proxy if ALPN doesn’t negotiate “h2” or the HTTP/2 request fails streaming thresholds.
+- Other validator tunables (already present and still honored):
+  - PROXXY_VALIDATOR_MIN_BYTES (default 4096)
+  - PROXXY_VALIDATOR_TTFB_SECONDS (default 0.8)
+  - PROXXY_VALIDATOR_READ_SECONDS (default 1.0)
+  - PROXXY_VALIDATOR_MIN_BPS (default 16384)
+  - PROXXY_VALIDATOR_DOUBLE_CHECK (default 1)
+  - PROXXY_VALIDATOR_SECOND_URL (optional second URL)
+  - PROXXY_VALIDATOR_OS_TRUST_PREFLIGHT (default 1)
+  - PROXXY_VALIDATOR_REQUIRE_HTTP11 applies only to the HTTP/1.1 fallback path (not used when H2 is required)
+
+Install dependencies
+- Using uv (recommended):
+  - uv sync
+- Using pip (if not using uv’s environment):
+  - pip install "httpx[http2]>=0.27.0"
+
+Operational notes
+- Strict H2 applies to HTTPS targets only (no h2c).
+- If httpx is missing at runtime, the validator emits a clear error reason and rejects the proxy (reason: h2_dep:httpx).
+- This change is backward-compatible for non-HTTPS URLs and for deployments that set PROXXY_VALIDATOR_HTTP2_ENABLE=0.
+
+Troubleshooting
+- curl error 92 during client usage should be filtered out by the validator. If encountered post-change, ensure:
+  - You ran uv sync (or installed httpx[http2]) so H2 can be exercised.
+  - Your PROXXY_VALIDATION_URL actually supports HTTP/2 at the origin (ALPN must return “h2”).
