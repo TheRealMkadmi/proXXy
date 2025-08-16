@@ -12,7 +12,7 @@ import time
 from .config import OrchestratorConfig, load_config_from_env
 from .status import Health, status_consumer, status_ticker
 from .pool_manager import PoolManager, PoolManagerConfig, pool_ingest_loop
-from .orchestrator import produce_process_loop, rota_server_loop
+from .orchestrator import produce_process_loop, rota_server_loop, tunnel_proxy_server_loop
 
 logger = logging.getLogger("proXXy.main")
 if not logger.handlers:
@@ -185,8 +185,11 @@ def main() -> int:
         daemon=True,
     )
     # Start proxy supervisor in a thread (launches rota subprocess)
+    # Select proxy implementation (default: tunnel). Set PROXXY_PROXY_IMPL=rota to use external rota.
+    impl = (os.getenv("PROXXY_PROXY_IMPL", "tunnel") or "tunnel").strip().lower()
+    proxy_target = rota_server_loop if impl == "rota" else tunnel_proxy_server_loop
     proxy_t = threading.Thread(
-        target=rota_server_loop,
+        target=proxy_target,
         name="proxy",
         args=(stop_thread, cfg, status_q),
         daemon=True,
@@ -214,7 +217,7 @@ def main() -> int:
             try:
                 logger.info(border)
                 logger.info("= PROXY READY: upstreams >= %d (have %d) =", min_required, ready)
-                logger.info("= Starting %s on %s:%d =", getattr(cfg, "rota_bin", "proxy"), cfg.proxy_host, cfg.proxy_port)
+                logger.info("= Starting %s on %s:%d =", (cfg.rota_bin if impl == "rota" else "tunnel"), cfg.proxy_host, cfg.proxy_port)
                 logger.info(border)
             except Exception:
                 pass

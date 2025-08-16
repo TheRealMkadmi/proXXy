@@ -11,6 +11,7 @@ from typing import List, Optional
 
 # Orchestrator operates as a library; config import is package-relative
 from .config import OrchestratorConfig, load_config_from_env
+from .proxy_server import run_tunnel_proxy
 
 logger = logging.getLogger("proXXy.orchestrator")
 
@@ -543,4 +544,150 @@ def rota_server_loop(stop: threading.Event, config: Optional[OrchestratorConfig]
                     proc.kill()
             except Exception:
                 pass
+        logger.info("proxy: stopped")
+
+def tunnel_proxy_server_loop(stop: threading.Event, config: Optional[OrchestratorConfig] = None, status_queue=None) -> None:
+    """
+    Start an in-process, tunneling-only forward proxy (no TLS interception).
+    - Listens on cfg.proxy_host:cfg.proxy_port
+    - Reads upstream proxies from cfg.pool_file_path (file-backed pool)
+    - Emits lifecycle events to status_queue: proxy_starting, proxy_started, proxy_ready, proxy_exit
+    """
+    cfg = config or load_config_from_env()
+
+    def emit(evt):
+        if status_queue is None:
+            return
+        try:
+            status_queue.put(evt)
+        except Exception:
+            pass
+
+    host = cfg.proxy_host
+    port = cfg.proxy_port
+    pool_file = cfg.pool_file_path
+    min_upstreams = max(0, int(getattr(cfg, "min_upstreams", 1)))
+    simulate = os.environ.get("PROXXY_PROXY_SIMULATE", "0").lower() not in ("0", "false", "no")
+
+    def _count_upstreams() -> int:
+        try:
+            with open(pool_file, "r", encoding="utf-8") as f:
+                count = 0
+                for ln in f:
+                    s = (ln or "").strip()
+                    if s and not s.lstrip().startswith("#"):
+                        count += 1
+                return count
+        except Exception:
+            return 0
+
+    if simulate:
+        # Simulated mode: announce and monitor file; do not start server
+        if min_upstreams > 0:
+            while not stop.is_set():
+                have = _count_upstreams()
+                if have >= min_upstreams:
+                    border = "=" * 72
+                    try:
+                        logger.info(border)
+                        logger.info("= PROXY READY: upstreams >= %d (have %d) =", min_upstreams, have)
+                        logger.info("= Simulated start on %s:%d =", host, port)
+                        logger.info(border)
+                    except Exception:
+                        pass
+                    break
+                try:
+                    emit({"type": "proxy_waiting", "have": int(have), "need": int(min_upstreams)})
+                except Exception:
+                    pass
+                stop.wait(1.0)
+            if stop.is_set():
+                return
+        emit({"type": "proxy_starting"})
+        try:
+            emit({"type": "proxy_started", "pid": int(os.getpid())})
+        except Exception:
+            emit({"type": "proxy_started"})
+        # Announce readiness once file has required entries
+        def _ready_watch_sim():
+            while not stop.is_set():
+                try:
+                    count = _count_upstreams()
+                    if count >= min_upstreams:
+                        logger.info("proxy: ready (simulated %s:%d; upstreams>=%d)", host, port, min_upstreams)
+                        try:
+                            emit({"type": "proxy_ready", "upstreams": int(count)})
+                        except Exception:
+                            pass
+                        return
+                except Exception:
+                    pass
+                stop.wait(0.5)
+        threading.Thread(target=_ready_watch_sim, name="proxy-ready-sim", daemon=True).start()
+
+        # Stream simple counters to console
+        def _sim_stream():
+            last = -1
+            while not stop.is_set():
+                cnt = _count_upstreams()
+                if cnt != last:
+                    logger.info("sim-tunnel: upstreams=%d file=%s", cnt, pool_file)
+                    last = cnt
+                stop.wait(1.0)
+        threading.Thread(target=_sim_stream, name="proxy-sim-stream", daemon=True).start()
+
+        # Hold until stop
+        while not stop.is_set():
+            stop.wait(0.5)
+        logger.info("proxy: stopped (simulated tunnel)")
+        return
+
+    # Non-simulated: wait for enough upstreams before starting server
+    if min_upstreams > 0:
+        while not stop.is_set():
+            have = _count_upstreams()
+            if have >= min_upstreams:
+                border = "=" * 72
+                try:
+                    logger.info(border)
+                    logger.info("= PROXY READY: upstreams >= %d (have %d) =", min_upstreams, have)
+                    logger.info("= Starting tunnel on %s:%d =", host, port)
+                    logger.info(border)
+                except Exception:
+                    pass
+                break
+            try:
+                emit({"type": "proxy_waiting", "have": int(have), "need": int(min_upstreams)})
+            except Exception:
+                pass
+            stop.wait(1.0)
+        if stop.is_set():
+            return
+
+    # Start server
+    emit({"type": "proxy_starting"})
+    try:
+        emit({"type": "proxy_started", "pid": int(os.getpid())})
+    except Exception:
+        emit({"type": "proxy_started"})
+
+    # Announce readiness (since min_upstreams satisfied at this point)
+    try:
+        cnt = _count_upstreams()
+        if cnt >= min_upstreams:
+            logger.info("proxy: ready (tunnel %s:%d; upstreams>=%d)", host, port, min_upstreams)
+            emit({"type": "proxy_ready", "upstreams": int(cnt)})
+    except Exception:
+        pass
+
+    try:
+        # Run the asyncio-based tunnel server in this thread until stop is set
+        run_tunnel_proxy(stop, host, port, pool_file, emit=emit)
+    except Exception as e:
+        logger.exception("proxy: tunnel server error: %s", e)
+    finally:
+        try:
+            emit({"type": "proxy_exit", "code": 0})
+        except Exception:
+            pass
         logger.info("proxy: stopped")
