@@ -5,7 +5,6 @@ import threading
 import time
 import socket
 import ssl
-import importlib
 from urllib.parse import urlparse
 from typing import Iterable, List, Optional, Set, Tuple, Dict, Any, Callable
 
@@ -53,23 +52,18 @@ _MIN_BPS = int(os.getenv("PROXXY_VALIDATOR_MIN_BPS", "16384"))
 _REQUIRE_HTTP11 = os.getenv("PROXXY_VALIDATOR_REQUIRE_HTTP11", "1")
 # OS trust TLS preflight via system CA store (replicates Schannel/curl behavior)
 _OS_TRUST_PREFLIGHT = os.getenv("PROXXY_VALIDATOR_OS_TRUST_PREFLIGHT", "1")
-# HTTP/2 validation toggles (strict by default; HTTPS targets only)
-_HTTP2_ENABLE = os.getenv("PROXXY_VALIDATOR_HTTP2_ENABLE", "1")
-_HTTP2_REQUIRED = os.getenv("PROXXY_VALIDATOR_HTTP2_REQUIRED", "1")
 
 def _os_trust_tls_preflight(proxy: str, url: str) -> Tuple[bool, str]:
     """
     Perform an OS-trust TLS preflight through the proxy using CONNECT to the target host.
     - Uses Windows/macOS OS trust via ssl.create_default_context + load_default_certs.
     - Fails when certificate chain is not trusted by OS (e.g., MITM or bad chain), mirroring curl/Schannel behavior.
-    - When PROXXY_VALIDATOR_HTTP2_REQUIRED=1 and target is HTTPS, negotiate ALPN and require 'h2'.
     Returns (ok, error_string)
     """
     try:
         u = urlparse(url)
         target_host = u.hostname or ""
         target_port = u.port or 443
-        target_scheme = (u.scheme or "").lower()
         pu = urlparse(proxy)
         proxy_host = pu.hostname or ""
         proxy_port = pu.port or (443 if (pu.scheme or "").lower() == "https" else 80)
@@ -103,32 +97,10 @@ def _os_trust_tls_preflight(proxy: str, url: str) -> Tuple[bool, str]:
                 ctx.load_default_certs(ssl.Purpose.SERVER_AUTH)
             except Exception:
                 pass
-            # If HTTP/2 is required for HTTPS targets, advertise ALPN h2 and enforce selection.
-            try:
-                http2_required = str(_HTTP2_REQUIRED).strip().lower() not in ("0", "false", "no", "off")
-                if http2_required and target_scheme == "https" and hasattr(ctx, "set_alpn_protocols"):
-                    ctx.set_alpn_protocols(["h2", "http/1.1"])
-            except Exception:
-                # Ignore ALPN configuration errors; handshake will still validate trust.
-                pass
 
             with ctx.wrap_socket(sock, server_hostname=target_host) as tls:
                 # Force handshake; will raise on untrusted roots/SAN mismatch
                 _ = tls.version()
-                try:
-                    # Enforce ALPN result when required
-                    http2_required = str(_HTTP2_REQUIRED).strip().lower() not in ("0", "false", "no", "off")
-                    if http2_required and target_scheme == "https":
-                        sel = ""
-                        try:
-                            sel = tls.selected_alpn_protocol() or ""
-                        except Exception:
-                            sel = ""
-                        if sel.lower() != "h2":
-                            return False, f"alpn:{sel or 'none'}"
-                except Exception:
-                    # If ALPN introspection fails, treat as failure only when strictly required
-                    return False, "alpn:introspect"
             return True, ""
     except ssl.SSLCertVerificationError as e:
         # Mirror useful details when available
@@ -407,26 +379,7 @@ def _check_one_requests(
 def _check_one(
     proxy: str, url: str, timeout: float, verify_ssl: bool, user_agent: Optional[str]
 ) -> Tuple[str, bool, Optional[int], Optional[str], Optional[float], Optional[str]]:
-    """
-    Route to HTTP/2 validation first (strict), then optionally fall back to HTTP/1.1.
-    - When PROXXY_VALIDATOR_HTTP2_REQUIRED=1 and target is HTTPS, only H2 success is accepted.
-    """
-    try:
-        sch = (urlparse(url).scheme or "").lower()
-    except Exception:
-        sch = "https"
-    http2_enable = str(_HTTP2_ENABLE).strip().lower() not in ("0", "false", "no", "off")
-    http2_required = str(_HTTP2_REQUIRED).strip().lower() not in ("0", "false", "no", "off")
-
-    # Try HTTP/2 first for HTTPS targets when enabled
-    if http2_enable and sch == "https":
-        p, ok, status, err, elapsed, final_url = _check_one_http2(proxy, url, timeout, verify_ssl, user_agent)
-        # In strict mode, return immediately (no fallback on H2 failure)
-        if http2_required or ok:
-            return p, ok, status, err, elapsed, final_url
-        # else fall through to HTTP/1.1 requests path as a best-effort
-
-    # Fallback to requests (HTTP/1.1)
+    # Single implementation: Requests only
     return _check_one_requests(proxy, url, timeout, verify_ssl, user_agent)
 
 
@@ -677,194 +630,3 @@ def check_proxies_stream(
         (max(1, completed) / max(1e-6, elapsed_total)),
     )
     return live_out, results
-# --- HTTP/2 validation path (httpx-based, strict) ---
-def _check_one_http2(
-    proxy: str, url: str, timeout: float, verify_ssl: bool, user_agent: Optional[str]
-) -> Tuple[str, bool, Optional[int], Optional[str], Optional[float], Optional[str]]:
-    """
-    Validate a proxy using a real HTTP/2 GET to the target URL with streaming thresholds.
-    - Requires ALPN 'h2' (enforced in TLS preflight when enabled) and response.http_version == 'HTTP/2'
-    - Applies TTFB, minimal bytes, and sustained throughput checks
-    Returns: (proxy, ok, status_code|None, error_reason|None, elapsed|None, final_url|None)
-    Error reasons use 'h2_*' prefixes to distinguish from HTTP/1.1 path.
-    """
-    try:
-        httpx_mod = importlib.import_module("httpx")
-    except Exception:
-        return proxy, False, None, "h2_dep:httpx", None, None
-
-    # Optional TCP preflight to quickly reject closed/unreachable proxies
-    try:
-        if (_TCP_PREFLIGHT or "1") and str(_TCP_PREFLIGHT).strip().lower() not in ("0", "false", "no", "off"):
-            pu = urlparse(proxy)
-            h = pu.hostname
-            p = pu.port or (443 if (pu.scheme or "").lower() == "https" else 80)
-            if h and p:
-                s = socket.create_connection((h, int(p)), timeout=min(_CONNECT_TIMEOUT_SECONDS, _ENFORCED_TIMEOUT_SECONDS, 3.0))
-                try:
-                    s.close()
-                except Exception:
-                    pass
-    except Exception as e:
-        return proxy, False, None, f"h2_tcp_preflight:{e}", None, None
-
-    # OS trust TLS preflight (with ALPN enforcement when required)
-    if (_OS_TRUST_PREFLIGHT or "1") and str(_OS_TRUST_PREFLIGHT).strip().lower() not in ("0", "false", "no", "off"):
-        ok_tls, tls_err = _os_trust_tls_preflight(proxy, url)
-        if not ok_tls:
-            return proxy, False, None, f"os_trust:{tls_err}", None, None
-
-    # Build httpx client with HTTP/2 enabled
-    try:
-        connect_t = min(_CONNECT_TIMEOUT_SECONDS, _ENFORCED_TIMEOUT_SECONDS)
-        to = httpx_mod.Timeout(connect=connect_t, read=_ENFORCED_TIMEOUT_SECONDS, write=_ENFORCED_TIMEOUT_SECONDS, pool=_ENFORCED_TIMEOUT_SECONDS)
-        proxies = {"http://": proxy, "https://": proxy}
-
-        # HTTP/2 does not allow 'Connection' header; avoid setting it.
-        headers: Dict[str, str] = {
-            "Accept": "*/*",
-            "Accept-Encoding": "identity",
-            "Accept-Language": os.getenv("PROXXY_VALIDATOR_ACCEPT_LANGUAGE", "en-US,en;q=0.9"),
-        }
-        ua = user_agent or os.getenv("PROXXY_VALIDATOR_USER_AGENT", _DEFAULT_UA)
-        if ua:
-            headers["User-Agent"] = ua
-
-        t0 = time.monotonic()
-        status = None
-        final_url = None
-
-        def _stream_once(client: Any, target: str, ttfb_s: float, read_window_s: float, min_bytes_req: int) -> Tuple[bool, int, bool, float, bytearray, Dict[str, str], Optional[str], str, int]:
-            nonlocal status, final_url
-            total = 0
-            start_read = time.monotonic()
-            first_byte_at: Optional[float] = None
-            seen_first = False
-            read_error = False
-            sample_buf = bytearray()
-
-            with client.stream("GET", target, headers=headers, follow_redirects=True) as resp:
-                status = resp.status_code
-                final_url = str(resp.url)
-                # Normalize headers to lower keys
-                hdrs = {str(k).lower(): str(v) for k, v in (resp.headers or {}).items()}
-
-                # HTTP/2 protocol check at response level
-                hv = ""
-                try:
-                    hv = str(getattr(resp, "http_version", "") or "").upper()
-                except Exception:
-                    # Fallback to httpx internal extension (best-effort)
-                    try:
-                        hv = str(resp.extensions.get("http_version") or "").upper()  # type: ignore[attr-defined]
-                    except Exception:
-                        hv = ""
-                if not hv.startswith("HTTP/2"):
-                    return False, total, read_error, start_read, sample_buf, hdrs, f"h2_httpver:{hv or 'none'}", final_url or target, status or 0
-
-                # Read streaming body with TTFB/throughput guards
-                try:
-                    for chunk in resp.iter_bytes(chunk_size=max(1, _CHUNK_SIZE)):
-                        now = time.monotonic()
-                        if not seen_first and (now - start_read) >= float(ttfb_s):
-                            read_error = True
-                            break
-                        if not chunk:
-                            if (now - start_read) >= float(read_window_s):
-                                break
-                            continue
-                        if not seen_first:
-                            seen_first = True
-                            first_byte_at = now
-                        total += len(chunk)
-                        if len(sample_buf) < 16384:
-                            take = min(len(chunk), 16384 - len(sample_buf))
-                            sample_buf.extend(chunk[:take])
-                        if total >= max(1, min_bytes_req) or (now - start_read) >= float(read_window_s):
-                            break
-                except Exception as e:
-                    return False, total, True, start_read, sample_buf, hdrs, f"h2_read:{str(e)[:128]}", final_url or target, status or 0
-
-            # Status and header sanity
-            status_ok = (status is not None) and (200 <= int(status) < 400)
-            if status and 300 <= int(status) < 400 and "location" not in hdrs:
-                status_ok = False
-
-            # Throughput after first byte
-            speed_ok = True
-            if seen_first and first_byte_at is not None:
-                dur = max(1e-6, (time.monotonic() - first_byte_at))
-                bps = total / dur
-                if bps < max(1, _MIN_BPS):
-                    speed_ok = False
-            else:
-                speed_ok = False
-
-            # Optional content signature checks
-            tokens_ok = True
-            try:
-                want = [t.strip().lower() for t in (os.getenv("PROXXY_VALIDATOR_BODY_CONTAINS", "") or "").split(",") if t.strip()]
-                if not want:
-                    uhost = (target or "").lower()
-                    if "netflix.com" in uhost:
-                        want = ["netflix"]
-                if want:
-                    text = bytes(sample_buf).decode("utf-8", errors="ignore").lower()
-                    tokens_ok = all(tok in text for tok in want)
-            except Exception:
-                tokens_ok = True
-
-            ok = status_ok and (total >= max(1, min_bytes_req)) and (not read_error) and speed_ok and tokens_ok
-            if not ok:
-                reasons: List[str] = []
-                if not status_ok:
-                    reasons.append(f"http={status}")
-                if read_error:
-                    reasons.append("ttfb" if not seen_first else "read")
-                if total < max(1, min_bytes_req):
-                    reasons.append(f"bytes={total}")
-                if not speed_ok:
-                    reasons.append("speed")
-                if not tokens_ok:
-                    reasons.append("tokens")
-                return False, total, read_error, start_read, sample_buf, hdrs, "h2:" + " ".join(reasons), final_url or target, status or 0
-            return True, total, read_error, start_read, sample_buf, hdrs, None, final_url or target, status or 0
-
-        # First pass
-        with httpx_mod.Client(http2=True, verify=verify_ssl, proxies=proxies, timeout=to) as client:
-            ok1, total1, read_err1, start1, sample1, hdrs1, err1, final1, status1 = _stream_once(
-                client, url, _TTFB_SECONDS, _READ_WINDOW_SECONDS, max(1, _MIN_BYTES)
-            )
-            ok = ok1
-            err = err1
-            final_url = final1
-            status = status1
-
-        # Optional second pass (double-check) to reduce flakiness
-        if ok and (os.getenv("PROXXY_VALIDATOR_DOUBLE_CHECK", "1").strip().lower() not in ("0", "false", "no", "off")):
-            target2 = _SECOND_URL or url
-            try:
-                with httpx_mod.Client(http2=True, verify=verify_ssl, proxies=proxies, timeout=to) as client2:
-                    ok2, total2, read_err2, start2, sample2, hdrs2, err2, final2, status2 = _stream_once(
-                        client2, target2, _TTFB_SECONDS, _RECHECK_READ_SECONDS, max(1, _MIN_BYTES)
-                    )
-                    if not ok2:
-                        ok = False
-                        err = err2 or "h2:recheck"
-                        final_url = final2
-                        status = status2
-            except Exception as e:
-                ok = False
-                err = f"h2_recheck:{str(e)[:128]}"
-
-        elapsed = time.monotonic() - t0
-        if ok:
-            return proxy, True, status, None, elapsed, final_url
-        else:
-            # Normalize status in error reporting
-            st = status if isinstance(status, int) else (None if status is None else int(status))
-            if err:
-                return proxy, False, st, err, elapsed, final_url
-            return proxy, False, st, f"h2_fail:http={st} url={final_url or url}", elapsed, final_url
-    except Exception as e:
-        return proxy, False, None, f"h2:{str(e)[:256]}", None, None
