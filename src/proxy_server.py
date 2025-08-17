@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
-# Minimal, tunneling-only forward proxy with upstream rotation via pool file.
+# Minimal, tunneling-only forward proxy with upstream selection via pool file.
 # - Supports HTTPS via CONNECT without MITM (no TLS termination on inbound).
 # - Supports plain HTTP proxying (absolute-form URIs preferred).
 # - Chains through upstream HTTP/HTTPS proxies listed in a pool file.
@@ -147,7 +147,7 @@ class PoolFileUpstreams:
 class TunnelProxyServer:
     """
     Inbound TCP proxy server that forwards requests via an upstream HTTP/HTTPS proxy
-    chosen from a rotating pool.
+    chosen from a dynamic pool.
 
     HTTPS: Tunnels via CONNECT without TLS interception.
     HTTP:  Proxies requests (absolute-form preferred). Minimal header rewriting.

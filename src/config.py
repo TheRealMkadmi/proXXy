@@ -11,7 +11,7 @@ class OrchestratorConfig:
     validation_url: str
     validator_workers: int
     validator_timeout: float
-    # Proxy (rota) listen config
+    # Proxy listen config
     proxy_host: str
     proxy_port: int
     proxy_log_level: str
@@ -19,7 +19,7 @@ class OrchestratorConfig:
     work_with_scheme_path: str
     # status ticker
     status_interval: int
-    # File-backed pool for rota (-f -w)
+    # File-backed pool
     pool_file_path: str
     pool_debounce_ms: int
     # Pool maintenance
@@ -27,11 +27,9 @@ class OrchestratorConfig:
     pool_prune_interval_seconds: int
     # Pool health re-check
     pool_health_url: str | None
-    # Minimum upstream proxies required before starting rota
+    # Minimum upstream proxies required before starting server
     min_upstreams: int
-    # Rota binary and optional extra flags
-    rota_bin: str
-    rota_extra: str
+    # (No proxy implementation choice; tunnel only)
 
 
 def load_config_from_env() -> OrchestratorConfig:
@@ -59,12 +57,8 @@ def load_config_from_env() -> OrchestratorConfig:
     pool_prune_interval_seconds = int(os.environ.get("PROXXY_POOL_PRUNE_INTERVAL_SECONDS", "30"))
     pool_health_url = os.environ.get("PROXXY_POOL_HEALTH_URL", validation_url)
     
-    # Minimum upstream proxies required before starting rota
+    # Minimum upstream proxies required before starting server
     min_upstreams = int(os.environ.get("PROXXY_MIN_UPSTREAMS", "10"))
-    
-    # Rota
-    rota_bin = os.environ.get("PROXXY_ROTA_BIN", "rota")
-    rota_extra = os.environ.get("PROXXY_ROTA_EXTRA", "")
 
     return OrchestratorConfig(
         output_dir=output_dir,
@@ -81,7 +75,5 @@ def load_config_from_env() -> OrchestratorConfig:
         pool_ttl_seconds=pool_ttl_seconds,
         pool_prune_interval_seconds=pool_prune_interval_seconds,
         pool_health_url=pool_health_url,
-        min_upstreams=min_upstreams,
-        rota_bin=rota_bin,
-        rota_extra=rota_extra,
+    min_upstreams=min_upstreams,
     )

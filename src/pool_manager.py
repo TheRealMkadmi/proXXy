@@ -259,7 +259,7 @@ class PoolManager:
     - Maintains a LivePool of proxies (dedup, ordering, TTL refresh).
     - Periodically prunes by TTL.
     - Optionally re-checks a sample to remove dead proxies.
-    - Mirrors the pool to a text file via atomic, debounced writes for consumption by rota (-f -w).
+    - Mirrors the pool to a text file via atomic, debounced writes for consumption by the proxy server.
     """
     def __init__(self, cfg: PoolManagerConfig, pool: Optional[LivePool] = None) -> None:
         self.pool = pool or LivePool()
@@ -283,7 +283,7 @@ class PoolManager:
             self.cfg.debounce_ms,
             self.pool.size(),
         )
-        # Initial write so rota sees an empty file immediately
+    # Initial write so the proxy server sees an empty file immediately
         try:
             self.file_sync.schedule()
         except Exception:

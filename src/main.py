@@ -12,7 +12,7 @@ import time
 from .config import OrchestratorConfig, load_config_from_env
 from .status import Health, status_consumer, status_ticker
 from .pool_manager import PoolManager, PoolManagerConfig, pool_ingest_loop
-from .orchestrator import produce_process_loop, rota_server_loop, tunnel_proxy_server_loop
+from .orchestrator import produce_process_loop, tunnel_proxy_server_loop
 
 logger = logging.getLogger("proXXy.main")
 if not logger.handlers:
@@ -29,7 +29,7 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     """
     ap = argparse.ArgumentParser(
         prog="proXXy",
-        description="Continuous proxy pipeline: scrape -> validate (stream) -> pool -> rota upstream rotation via file.",
+        description="Continuous proxy pipeline: scrape -> validate (stream) -> pool -> proxy server.",
     )
     # Only set values when flags are provided (no default), so env/defaults remain if omitted.
     ap.add_argument("--output-dir", dest="output_dir", help="Override PROXXY_OUTPUT_DIR")
@@ -41,7 +41,7 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--proxy-log-level", dest="proxy_log_level", help="Override PROXXY_PROXY_LOG_LEVEL (e.g., WARNING, INFO)")
     ap.add_argument("--status-interval", dest="status_interval", type=int, help="Override PROXXY_STATUS_INTERVAL_SECONDS")
 
-    # File-backed pool and rota overrides
+    # File-backed pool overrides
     ap.add_argument("--pool-file", dest="pool_file", help="Override PROXXY_POOL_FILE (default ./proxies.txt)")
     ap.add_argument("--pool-debounce-ms", dest="pool_debounce_ms", type=int, help="Override PROXXY_POOL_DEBOUNCE_MS (default 150)")
     ap.add_argument("--pool-ttl-seconds", dest="pool_ttl_seconds", type=int, help="Override PROXXY_POOL_TTL_SECONDS (default 900)")
@@ -51,8 +51,7 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--pool-recheck-workers", dest="pool_recheck_workers", type=int, help="Override PROXXY_POOL_RECHECK_WORKERS (default 32)")
     ap.add_argument("--pool-recheck-timeout", dest="pool_recheck_timeout", type=float, help="Override PROXXY_POOL_RECHECK_TIMEOUT (seconds, default 2.5)")
     
-    ap.add_argument("--rota-extra", dest="rota_extra", help="Override PROXXY_ROTA_EXTRA (extra flags)")
-    ap.add_argument("--min-upstreams", "--min-proxies", dest="min_upstreams", type=int, help="Override PROXXY_MIN_UPSTREAMS (minimum upstream proxies required before starting rota)")
+    ap.add_argument("--min-upstreams", "--min-proxies", dest="min_upstreams", type=int, help="Override PROXXY_MIN_UPSTREAMS (minimum upstream proxies required before starting server)")
     
     # Optional convenience flags
     ap.add_argument("--scraper-log-level", dest="scraper_log_level", help="Set PROXXY_SCRAPER_LOG_LEVEL for Scrapy logs")
@@ -60,13 +59,13 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--proxy-capture-output",
         dest="proxy_capture_output",
         choices=["0", "1"],
-        help="Set PROXXY_PROXY_CAPTURE_OUTPUT (1 to capture proxy.py stdout/stderr into main logs, 0 to suppress)",
+    help="Set PROXXY_PROXY_CAPTURE_OUTPUT (reserved; no effect for tunnel)",
     )
     ap.add_argument(
         "--proxy-simulate",
         dest="proxy_simulate",
         choices=["0", "1"],
-        help="Set PROXXY_PROXY_SIMULATE (1 to simulate rota; no binary needed)",
+    help="Set PROXXY_PROXY_SIMULATE (1 to simulate; no server)",
     )
     return ap.parse_args(argv)
 
@@ -83,7 +82,7 @@ def main() -> int:
         "proxy_port": "PROXXY_PROXY_PORT",
         "proxy_log_level": "PROXXY_PROXY_LOG_LEVEL",
         "status_interval": "PROXXY_STATUS_INTERVAL_SECONDS",
-        # File-backed pool + rota
+    # File-backed pool
         "pool_file": "PROXXY_POOL_FILE",
         "pool_debounce_ms": "PROXXY_POOL_DEBOUNCE_MS",
         "pool_ttl_seconds": "PROXXY_POOL_TTL_SECONDS",
@@ -92,8 +91,7 @@ def main() -> int:
         "pool_recheck_per_interval": "PROXXY_POOL_RECHECK_PER_INTERVAL",
         "pool_recheck_workers": "PROXXY_POOL_RECHECK_WORKERS",
         "pool_recheck_timeout": "PROXXY_POOL_RECHECK_TIMEOUT",
-        "min_upstreams": "PROXXY_MIN_UPSTREAMS",
-        "rota_extra": "PROXXY_ROTA_EXTRA",
+    "min_upstreams": "PROXXY_MIN_UPSTREAMS",
         # Pass-through for dependent components
         "scraper_log_level": "PROXXY_SCRAPER_LOG_LEVEL",
         "proxy_capture_output": "PROXXY_PROXY_CAPTURE_OUTPUT",
@@ -184,26 +182,21 @@ def main() -> int:
         name="producer-proc",
         daemon=True,
     )
-    # Start proxy supervisor in a thread (launches rota subprocess)
-    # Select proxy implementation (default: tunnel). Set PROXXY_PROXY_IMPL=rota to use external rota.
-    impl = (os.getenv("PROXXY_PROXY_IMPL", "tunnel") or "tunnel").strip().lower()
-    proxy_target = rota_server_loop if impl == "rota" else tunnel_proxy_server_loop
-    proxy_t = threading.Thread(
-        target=proxy_target,
-        name="proxy",
-        args=(stop_thread, cfg, status_q),
-        daemon=True,
-    )
+    # Start proxy server in a thread (tunnel backend only)
+    def _proxy_thread():
+        tunnel_proxy_server_loop(stop_thread, cfg, status_q)
+
+    proxy_t = threading.Thread(target=_proxy_thread, name="proxy", daemon=True)
 
     consumer_t.start()
     if ticker_interval > 0:
         ticker_t.start()
     producer.start()
 
-    # Wait for enough upstream proxies before starting rota (gate launch)
+    # Wait for enough upstream proxies before starting proxy (gate launch)
     min_required = max(0, int(getattr(cfg, "min_upstreams", 1)))
     if min_required > 0:
-        logger.info("proxy: waiting for at least %d upstream proxies before starting rota...", min_required)
+        logger.info("proxy: waiting for at least %d upstream proxies before start...", min_required)
     last_log = time.monotonic()
     while not stop_thread.is_set():
         if min_required <= 0:
@@ -217,7 +210,7 @@ def main() -> int:
             try:
                 logger.info(border)
                 logger.info("= PROXY READY: upstreams >= %d (have %d) =", min_required, ready)
-                logger.info("= Starting %s on %s:%d =", (cfg.rota_bin if impl == "rota" else "tunnel"), cfg.proxy_host, cfg.proxy_port)
+                logger.info("= Starting tunnel on %s:%d =", cfg.proxy_host, cfg.proxy_port)
                 logger.info(border)
             except Exception:
                 pass
