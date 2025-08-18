@@ -78,7 +78,7 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
             for s in scrapers:
                 try:
                     sname = getattr(s, "name", s.__class__.__name__)
-                    logger.info("scrape.%s: starting", sname)
+                    logger.debug("scrape.%s: starting", sname)
                     t_s0 = time.perf_counter()
                     items = s.scrape()
                     dt_s = time.perf_counter() - t_s0
@@ -88,7 +88,7 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
                             seen.add(p)
                             proxies_all.append(p)
                             added += 1
-                    logger.info("scrape.%s: got=%d added=%d dupes=%d in %.2fs", sname, len(items), added, len(items) - added, dt_s)
+                    logger.debug("scrape.%s: got=%d added=%d dupes=%d in %.2fs", sname, len(items), added, len(items) - added, dt_s)
                 except Exception:
                     logger.exception("scrape.%s: failed", getattr(s, "name", s.__class__.__name__))
             scrape_dt = time.perf_counter() - t0
@@ -151,6 +151,8 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
 
             t_val0 = time.perf_counter()
             live_count = 0
+            completed_count = 0
+            last_progress_emit = time.monotonic()
             batch: List[str] = []
 
             def _flush_batch():
@@ -178,8 +180,23 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
                 if len(batch) >= 200:
                     _flush_batch()
 
-            def _on_result(_details: dict) -> None:
-                # Optional: could emit validate_progress here if desired
+            def _on_result(details: dict) -> None:
+                nonlocal completed_count, last_progress_emit
+                completed_count += 1
+                now = time.monotonic()
+                if (completed_count % 500 == 0) or (now - last_progress_emit >= 1.0) or (completed_count >= candidates_count):
+                    last_progress_emit = now
+                    try:
+                        emit({
+                            "type": "validate_progress",
+                            "completed": completed_count,
+                            "live": live_count,
+                            "total": candidates_count,
+                            "workers": int(getattr(cfg, "validator_workers", 0) or 0),
+                            "ts": time.time(),
+                        })
+                    except Exception:
+                        pass
                 return
 
             try:

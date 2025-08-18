@@ -34,13 +34,27 @@ class StaticUrlTextScraper:
             return []
 
         total_sources = sum(len(v) for v in subset.values() if isinstance(v, list))
-        logger.info("static_url_text: starting scrape (protocols=%s, urls=%d, verify_ssl=%s)", ",".join(self.protocols), total_sources, self.verify_ssl)
+        logger.debug("static_url_text: starting scrape (protocols=%s, urls=%d, verify_ssl=%s)", ",".join(self.protocols), total_sources, self.verify_ssl)
 
         headers = {"User-Agent": "proXXy/1.0 (+https://github.com/)"}
         out: List[str] = []
         seen = set()
         sess = requests.Session()
         sess.trust_env = False
+
+        # Suppress noisy TLS warnings when verify_ssl is disabled (debug convenience)
+        if not self.verify_ssl:
+            try:
+                import urllib3  # type: ignore
+                from urllib3.exceptions import InsecureRequestWarning  # type: ignore
+                urllib3.disable_warnings(InsecureRequestWarning)
+            except Exception:
+                pass
+
+        attempted = 0
+        ok_urls = 0
+        http_fail = 0
+        err_urls = 0
 
         for proto, items in subset.items():
             for it in items:
@@ -50,37 +64,27 @@ class StaticUrlTextScraper:
                 elif isinstance(it, dict):
                     url = str(it.get("url", "")).strip()
                 if not url:
-                    logger.debug("static_url_text: skipping empty URL entry (%s)", proto)
                     continue
 
-                t0 = time.perf_counter()
+                attempted += 1
                 try:
-                    logger.debug("static_url_text.fetch: [%s] %s", proto, url)
                     resp = sess.get(url, timeout=5, headers=headers, verify=self.verify_ssl)
-                    dt = time.perf_counter() - t0
-                    status = resp.status_code
-                    if not (200 <= status < 400):
-                        logger.warning("static_url_text.fetch: [%s] %s -> HTTP %s in %.2fs", proto, url, status, dt)
+                    if not (200 <= resp.status_code < 400):
+                        http_fail += 1
                         continue
 
                     content = resp.text or ""
-                    size = len(content.encode("utf-8"))
-                    found = 0
                     for p in extract_proxies(content):
                         if p not in seen:
                             seen.add(p)
                             out.append(p)
-                            found += 1
-
-                    if found == 0:
-                        logger.warning("static_url_text.parse: [%s] %s -> 0 proxies (status=%d, bytes=%d, %.2fs)", proto, url, status, size, dt)
-                    else:
-                        logger.info("static_url_text.parse: [%s] %s -> %d proxies (status=%d, bytes=%d, %.2fs)", proto, url, found, status, size, dt)
-                    logger.debug("static_url_text.sample: [%s] %s -> first-bytes='%s'", proto, url, (content[:80].replace("\\n"," ") if content else ""))
-                except Exception as e:
-                    dt = time.perf_counter() - t0
-                    logger.warning("static_url_text.fetch: [%s] %s -> error %s: %s in %.2fs", proto, url, e.__class__.__name__, str(e)[:200], dt)
+                    ok_urls += 1
+                except Exception:
+                    err_urls += 1
                     continue
 
-        logger.info("static_url_text: done (total=%d unique)", len(out))
+        logger.info(
+            "static_url_text: done urls=%d ok=%d http_fail=%d err=%d total=%d unique",
+            attempted, ok_urls, http_fail, err_urls, len(out)
+        )
         return out

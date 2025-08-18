@@ -113,28 +113,39 @@ class ProxyDBScraper:
         headers = {"User-Agent": self.user_agent} if self.user_agent else None
         sess = requests.Session()
         sess.trust_env = False
+
+        # Suppress noisy TLS warnings when verify_ssl is disabled (debug convenience)
+        if not self.verify_ssl:
+            try:
+                import urllib3  # type: ignore
+                from urllib3.exceptions import InsecureRequestWarning  # type: ignore
+                urllib3.disable_warnings(InsecureRequestWarning)
+            except Exception:
+                pass
  
-        logger.info("proxydb: starting (protocol=%s, pages=%d, verify_ssl=%s, ua=%s)",
+        logger.debug("proxydb: starting (protocol=%s, pages=%d, verify_ssl=%s, ua=%s)",
                     self.protocol, self.pages, self.verify_ssl, bool(self.user_agent))
  
         # ProxyDB paginates in steps of 30
         step = 30
  
+        fetch_attempted = 0
+        fetch_ok = 0
+        fetch_http_fail = 0
+        fetch_err = 0
+ 
         def fetch(offset: int) -> str:
+            nonlocal fetch_attempted, fetch_ok, fetch_http_fail, fetch_err
             url = self._build_url(offset=offset)
-            t0 = time.perf_counter()
+            fetch_attempted += 1
             try:
-                logger.debug("proxydb.fetch: %s", url)
                 resp = sess.get(url, headers=headers, timeout=self.timeout, verify=self.verify_ssl)
-                dt = time.perf_counter() - t0
                 if 200 <= resp.status_code < 400:
-                    txt = resp.text or ""
-                    logger.info("proxydb.fetch: %s -> %d (%d bytes) in %.2fs", url, resp.status_code, len(txt.encode('utf-8')), dt)
-                    return txt
-                logger.warning("proxydb.fetch: %s -> HTTP %d in %.2fs", url, resp.status_code, dt)
-            except Exception as e:
-                dt = time.perf_counter() - t0
-                logger.warning("proxydb.fetch: %s -> error %s: %s in %.2fs", url, e.__class__.__name__, str(e)[:200], dt)
+                    fetch_ok += 1
+                    return resp.text or ""
+                fetch_http_fail += 1
+            except Exception:
+                fetch_err += 1
             return ""
  
         # First: fetch page 1 (offset 0)
@@ -148,7 +159,6 @@ class ProxyDBScraper:
             if item not in seen:
                 seen.add(item)
                 results.append(item)
-        logger.info("proxydb.parse: offset=0 -> %d items", len(first_items))
  
         # Try to parse total proxies, e.g.: "Showing 1 to 30 of 2,345 total proxies"
         total_count: Optional[int] = None
@@ -165,7 +175,6 @@ class ProxyDBScraper:
             total_pages = max(1, math.ceil(total_count / step))
         else:
             total_pages = max(1, int(self.pages))
-        logger.info("proxydb: total_pages=%d (step=%d)", total_pages, step)
  
         # Prepare remaining offsets (we already fetched offset 0)
         remaining_offsets = [i * step for i in range(1, total_pages)]
@@ -177,14 +186,13 @@ class ProxyDBScraper:
                     html = fut.result() or ""
                     if not html:
                         continue
-                    items = self._extract_from_html(html)
-                    added = 0
-                    for item in items:
+                    for item in self._extract_from_html(html):
                         if item not in seen:
                             seen.add(item)
                             results.append(item)
-                            added += 1
-                    logger.info("proxydb.parse: offset=%d -> got=%d added=%d dupes=%d", future_map[fut], len(items), added, len(items)-added)
  
-        logger.info("proxydb: done total=%d unique", len(results))
+        logger.info(
+            "proxydb: done total=%d unique fetches=%d ok=%d http_fail=%d err=%d",
+            len(results), fetch_attempted, fetch_ok, fetch_http_fail, fetch_err
+        )
         return results
