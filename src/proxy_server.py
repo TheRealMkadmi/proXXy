@@ -8,7 +8,7 @@ import ssl
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Set
 from urllib.parse import urlsplit
 
 # Minimal, tunneling-only forward proxy with upstream selection via pool file.
@@ -185,6 +185,8 @@ class TunnelProxyServer:
         self.scan_budget = float(os.getenv("PROXXY_PROXY_UPSTREAM_SCAN_BUDGET", "8.0"))
         # Dedicated idle timeout for CONNECT tunnels; 0 = no idle timeout (recommended for H2)
         self.tunnel_idle_timeout = float(os.getenv("PROXXY_PROXY_TUNNEL_IDLE_TIMEOUT", "0"))
+        # Track active client handler tasks for graceful shutdown
+        self._client_tasks: Set[asyncio.Task] = set()
 
     async def start(self) -> None:
         self._server = await asyncio.start_server(self._handle_client, self.host, self.port, start_serving=True)
@@ -200,6 +202,21 @@ class TunnelProxyServer:
             except Exception:
                 pass
             self._server = None
+        # Cancel and await active client tasks to avoid "Task was destroyed but it is pending!"
+        try:
+            tasks = list(getattr(self, "_client_tasks", []))
+            for t in tasks:
+                try:
+                    t.cancel()
+                except Exception:
+                    pass
+            if tasks:
+                try:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     async def serve_until(self, stop_evt: threading.Event) -> None:
         await self.start()
@@ -211,6 +228,13 @@ class TunnelProxyServer:
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
         # no sticky upstream; select upstream per request
+        # Register this handler task for graceful shutdown
+        try:
+            cur = asyncio.current_task()
+            if cur is not None:
+                self._client_tasks.add(cur)
+        except Exception:
+            pass
         try:
             # Parse request line
             line = await asyncio.wait_for(reader.readline(), timeout=self.io_timeout)
@@ -284,6 +308,13 @@ class TunnelProxyServer:
                         await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
                     except Exception:
                         pass
+            except Exception:
+                pass
+            # Unregister this handler task
+            try:
+                cur = asyncio.current_task()
+                if cur is not None:
+                    self._client_tasks.discard(cur)
             except Exception:
                 pass
 
@@ -539,21 +570,48 @@ class TunnelProxyServer:
 
         t1 = asyncio.create_task(pump(a_r, b_w))
         t2 = asyncio.create_task(pump(b_r, a_w))
-        # Wait for both directions to finish (EOF or idle timeout) to avoid abrupt half-closes that break H2
-        await asyncio.gather(t1, t2, return_exceptions=True)
-        # Close both writers
-        for w in (a_w, b_w):
+        try:
+            # When one direction finishes (EOF/idle), cancel the peer pump to avoid lingering pending tasks
+            done, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
+            for t in pending:
+                try:
+                    t.cancel()
+                except Exception:
+                    pass
+            # Ensure cancellation is observed
             try:
-                if not w.is_closing():
-                    w.close()
+                await asyncio.gather(*pending, return_exceptions=True)
             except Exception:
                 pass
-        # Best-effort wait
-        for w in (a_w, b_w):
+        except asyncio.CancelledError:
+            # If the handler is cancelled, ensure both pump tasks are cancelled and awaited
             try:
-                await asyncio.wait_for(w.wait_closed(), timeout=1.0)
+                t1.cancel()
             except Exception:
                 pass
+            try:
+                t2.cancel()
+            except Exception:
+                pass
+            try:
+                await asyncio.gather(t1, t2, return_exceptions=True)
+            except Exception:
+                pass
+            raise
+        finally:
+            # Close both writers
+            for w in (a_w, b_w):
+                try:
+                    if not w.is_closing():
+                        w.close()
+                except Exception:
+                    pass
+            # Best-effort wait
+            for w in (a_w, b_w):
+                try:
+                    await asyncio.wait_for(w.wait_closed(), timeout=1.0)
+                except Exception:
+                    pass
 
     async def _respond(self, w: asyncio.StreamWriter, code: int, text: str) -> None:
         await self._respond_raw(w, f"HTTP/1.1 {code} {text}\r\nProxy-Agent: proXXy-tunnel\r\n\r\n".encode("latin1"))
