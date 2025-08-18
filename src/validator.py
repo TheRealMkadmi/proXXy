@@ -198,6 +198,19 @@ def _check_one_requests(
     """
     sess = _get_session(timeout, verify_ssl, user_agent)
     proxies = {"http": proxy, "https": proxy}
+    # Strict recheck profile (env toggle) adjusts effective windows and throughput threshold without mutating globals
+    strict_recheck = os.getenv("PROXXY_VALIDATOR_RECHECK_STRICT", "0").strip().lower() not in ("0", "false", "no", "off")
+    eff_TTFB = float(os.getenv("PROXXY_VALIDATOR_TTFB_SECONDS", str(_TTFB_SECONDS)))
+    eff_READ = float(os.getenv("PROXXY_VALIDATOR_READ_SECONDS", str(_READ_WINDOW_SECONDS)))
+    eff_MIN_BPS = int(os.getenv("PROXXY_VALIDATOR_MIN_BPS", str(_MIN_BPS)))
+    if strict_recheck:
+        eff_TTFB = min(eff_TTFB, float(os.getenv("PROXXY_VALIDATOR_STRICT_TTFB_SECONDS", "1.5")))
+        eff_READ = min(eff_READ, float(os.getenv("PROXXY_VALIDATOR_STRICT_READ_SECONDS", "1.5")))
+        try:
+            mul = float(os.getenv("PROXXY_VALIDATOR_STRICT_BPS_MULTIPLIER", "1.5"))
+        except Exception:
+            mul = 1.5
+        eff_MIN_BPS = max(eff_MIN_BPS, int(eff_MIN_BPS * mul))
     # Optional TCP preflight to weed out proxies with closed or unresponsive ports quickly
     try:
         if (_TCP_PREFLIGHT or "1") and str(_TCP_PREFLIGHT).strip().lower() not in ("0", "false", "no", "off"):
@@ -257,6 +270,7 @@ def _check_one_requests(
         first_byte_at: Optional[float] = None
         seen_first = False
         read_error = False
+        reason_code: Optional[str] = None
         # Capture a sample of response bytes for content signature checks
         sample_buf = bytearray()
         min_bytes = max(1, _MIN_BYTES)
@@ -264,11 +278,13 @@ def _check_one_requests(
             for chunk in resp.iter_content(chunk_size=max(1, _CHUNK_SIZE)):
                 now = time.monotonic()
                 # TTFB guard: if no data within threshold, treat as failure
-                if not seen_first and (now - start_read) >= float(_TTFB_SECONDS):
+                if not seen_first and (now - start_read) >= float(eff_TTFB):
                     read_error = True
+                    if reason_code is None:
+                        reason_code = "ttfb_timeout"
                     break
                 if not chunk:
-                    if (now - start_read) >= float(_READ_WINDOW_SECONDS):
+                    if (now - start_read) >= float(eff_READ):
                         break
                     continue
                 if not seen_first:
@@ -301,6 +317,8 @@ def _check_one_requests(
             except Exception:
                 # if unknown, don't fail solely on this
                 pass
+        if not version_ok and reason_code is None:
+            reason_code = "version_mismatch"
 
         # Throughput after first byte
         speed_ok = True
@@ -321,7 +339,14 @@ def _check_one_requests(
                 tokens_ok = all(tok in text for tok in want)
         except Exception:
             tokens_ok = True  # don't fail solely on token parsing
+        if not tokens_ok and reason_code is None:
+            reason_code = "token_mismatch"
 
+        if not status_ok and reason_code is None:
+            try:
+                reason_code = f"http_status_{int(resp.status_code)}"
+            except Exception:
+                reason_code = "http_status"
         ok = status_ok and (total >= min_bytes) and (not read_error) and version_ok and tokens_ok
         try:
             elapsed = float(resp.elapsed.total_seconds()) if resp.elapsed is not None else None
@@ -334,19 +359,21 @@ def _check_one_requests(
         resp.close()
 
         # Optional double-check to reduce false positives that die immediately after first success
-        if ok and (os.getenv("PROXXY_VALIDATOR_DOUBLE_CHECK", "1").strip().lower() not in ("0", "false", "no", "off")):
-            # Decide whether to double-check: sample or borderline results
+        double_check_enabled = os.getenv("PROXXY_VALIDATOR_DOUBLE_CHECK", "1").strip().lower() not in ("0", "false", "no", "off")
+        if ok and (double_check_enabled or strict_recheck):
+            # Decide whether to double-check: always in strict mode; else sample or borderline results
             borderline = (total < max(min_bytes * 2, min_bytes + 2048))
             try:
                 if seen_first and first_byte_at is not None:
                     dur_tmp = max(1e-6, (time.monotonic() - first_byte_at))
                     bps_tmp = total / dur_tmp
-                    if bps_tmp < (_MIN_BPS * 1.25):
+                    if bps_tmp < (eff_MIN_BPS * 1.25):
                         borderline = True
             except Exception:
                 pass
-            if not borderline and random.random() >= max(0.0, min(1.0, _DOUBLE_CHECK_RATIO)):
-                return proxy, ok, status, None if ok else f"http={status} bytes={total}", elapsed, final_url
+            if not strict_recheck:
+                if not borderline and random.random() >= max(0.0, min(1.0, _DOUBLE_CHECK_RATIO)):
+                    return proxy, ok, status, None if ok else f"http={status} bytes={total}", elapsed, final_url
             target2 = _SECOND_URL or url
             try:
                 # fresh session to ensure a new TCP connection path (avoid pooled reuse)
@@ -437,7 +464,9 @@ def _check_one_requests(
             except Exception:
                 ok = False
 
-        return proxy, ok, status, None if ok else f"http={status} bytes={total}", elapsed, final_url
+        # Prefer structured error code when available
+        err_out = None if ok else (reason_code or f"http={status} bytes={total}")
+        return proxy, ok, status, err_out, elapsed, final_url
     except Exception as e:
         return proxy, False, None, str(e), None, None
 

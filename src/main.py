@@ -68,7 +68,7 @@ def main() -> int:
         "proxy_port": "PROXXY_PROXY_PORT",
         "proxy_log_level": "PROXXY_PROXY_LOG_LEVEL",
         "status_interval": "PROXXY_STATUS_INTERVAL_SECONDS",
-    # File-backed pool
+        # File-backed pool
         "pool_file": "PROXXY_POOL_FILE",
         "pool_debounce_ms": "PROXXY_POOL_DEBOUNCE_MS",
         "pool_ttl_seconds": "PROXXY_POOL_TTL_SECONDS",

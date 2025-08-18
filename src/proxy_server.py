@@ -8,7 +8,7 @@ import ssl
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple, Set
+from typing import Callable, Dict, List, Optional, Tuple, Set, cast
 from urllib.parse import urlsplit
 
 # Minimal, tunneling-only forward proxy with upstream selection via pool file.
@@ -23,6 +23,19 @@ if not logger.handlers:
         level=os.environ.get("PROXXY_LOG_LEVEL", "INFO"),
         format="%(asctime)s [%(levelname)s] %(processName)s(%(process)d)/%(threadName)s: %(message)s",
     )
+
+# Diagnostics controls
+_DIAG_STR = os.getenv("PROXXY_TUNNEL_DIAG", "basic").strip().lower()
+_DIAG_ON = _DIAG_STR not in ("0", "off", "false", "no")
+_DIAG_VERBOSE = _DIAG_STR in ("verbose", "v", "debug")
+_FAIL_LOG_EVERY = max(1, int(os.getenv("PROXXY_TUNNEL_FAIL_LOG_EVERY", "1")))
+
+def _new_cid() -> str:
+    try:
+        n = (time.time_ns() ^ os.getpid() ^ threading.get_ident())
+        return f"{n & 0xFFFFFFFFFFFF:012x}"
+    except Exception:
+        return f"{int(time.time()*1000) % 1000000000:09d}"
 
 
 @dataclass(frozen=True)
@@ -227,7 +240,7 @@ class TunnelProxyServer:
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
-        # no sticky upstream; select upstream per request
+        cid = _new_cid()
         # Register this handler task for graceful shutdown
         try:
             cur = asyncio.current_task()
@@ -241,15 +254,24 @@ class TunnelProxyServer:
             if not line:
                 return
             if len(line) > self.max_line_bytes:
+                if _DIAG_ON:
+                    logger.info("tunnel[%s]: reject peer=%s reason=uri_too_long", cid, peer)
                 await self._respond(writer, 414, "Request-URI Too Long")
                 return
             req_line = line.decode("latin1", "replace").rstrip("\r\n")
             parts = req_line.split(" ")
             if len(parts) < 3:
+                if _DIAG_ON:
+                    logger.info("tunnel[%s]: reject peer=%s reason=bad_request_line line=%r", cid, peer, req_line[:256])
                 await self._respond(writer, 400, "Bad Request")
                 return
             method, target, version = parts[0].upper(), parts[1], parts[2]
-
+            if _DIAG_ON:
+                try:
+                    logger.info("tunnel[%s]: accept peer=%s %s %s %s pool=%d", cid, peer, method, target, version, self.pool.size())
+                except Exception:
+                    pass
+    
             # Headers
             headers: List[str] = []
             total = len(line)
@@ -259,43 +281,54 @@ class TunnelProxyServer:
                     break
                 total += len(h)
                 if total > self.max_header_bytes:
+                    if _DIAG_ON:
+                        logger.info("tunnel[%s]: reject peer=%s reason=header_too_large", cid, peer)
                     await self._respond(writer, 431, "Request Header Fields Too Large")
                     return
                 if h in (b"\r\n", b"\n"):
                     break
                 headers.append(h.decode("latin1", "replace").rstrip("\r\n"))
-
+    
             hdr_map: Dict[str, str] = {}
             for h in headers:
                 if ":" in h:
                     k, v = h.split(":", 1)
                     hdr_map[k.strip().lower()] = v.lstrip()
-
+    
             # HTTP/2 (h2/h2c) detection and graceful refusal (we operate as HTTP/1.1 proxy)
             if method == "PRI" and target == "*" and version.upper().startswith("HTTP/2"):
+                if _DIAG_ON:
+                    logger.info("tunnel[%s]: reject peer=%s reason=http2_pri", cid, peer)
                 await self._respond(writer, 505, "HTTP Version Not Supported")
                 return
             if version.upper().startswith("HTTP/2"):
+                if _DIAG_ON:
+                    logger.info("tunnel[%s]: reject peer=%s reason=http2", cid, peer)
                 await self._respond(writer, 505, "HTTP Version Not Supported")
                 return
             upg = hdr_map.get("upgrade", "").lower()
             if "h2c" in upg or "http2-settings" in hdr_map:
+                if _DIAG_ON:
+                    logger.info("tunnel[%s]: reject peer=%s reason=h2c_upgrade", cid, peer)
                 await self._respond(writer, 505, "HTTP Version Not Supported")
                 return
-
-            # No sticky upstream; choose per-request in handler
+    
             if self.pool.size() <= 0:
+                if _DIAG_ON:
+                    logger.warning("tunnel[%s]: no_upstreams_available", cid)
                 await self._respond(writer, 503, "No Upstreams Available")
                 return
-
+    
             if method == "CONNECT":
-                await self._handle_connect(target, hdr_map, reader, writer, None)
+                await self._handle_connect(target, hdr_map, reader, writer, None, cid=cid)
             else:
-                await self._handle_http(method, target, version, headers, hdr_map, reader, writer, None)
+                await self._handle_http(method, target, version, headers, hdr_map, reader, writer, None, cid=cid)
         except asyncio.TimeoutError:
+            if _DIAG_ON:
+                logger.info("tunnel[%s]: client_timeout peer=%s", cid, peer)
             await self._respond(writer, 408, "Request Timeout")
         except Exception as e:
-            logger.debug("tunnel: client error peer=%s err=%s", peer, e)
+            logger.debug("tunnel[%s]: client error peer=%s err=%s", cid, peer, e)
             try:
                 await self._respond(writer, 400, "Bad Request")
             except Exception:
@@ -325,13 +358,16 @@ class TunnelProxyServer:
         client_r: asyncio.StreamReader,
         client_w: asyncio.StreamWriter,
         sticky: Optional[UpstreamProxy] = None,
+        cid: Optional[str] = None,
     ) -> None:
         # Parse host:port
         host, port = self._split_host_port(target)
         if not host or port is None:
+            if _DIAG_ON:
+                logger.info("tunnel[%s]: reject reason=bad_connect_target target=%r", cid, target)
             await self._respond(client_w, 400, "Bad CONNECT Target")
             return
-
+    
         attempts = self.max_retries + 1
         last_err: Optional[str] = None
         # Build candidate list: prefer sticky, then extras to honor retries
@@ -349,6 +385,7 @@ class TunnelProxyServer:
             _seen_keys.add(_key)
             candidates.append(up)
         # Skip recently failed upstreams within TTL window (only if TTL > 0)
+        skipped_ttl = 0
         if self.failure_ttl > 0:
             now_ts = time.monotonic()
             filtered: List[UpstreamProxy] = []
@@ -356,20 +393,39 @@ class TunnelProxyServer:
                 _key = (up.scheme, up.host, up.port, up.username or "", up.password or "")
                 ts = self._failures.get(_key, 0.0)
                 if ts and (now_ts - ts) < self.failure_ttl:
+                    skipped_ttl += 1
                     continue
                 filtered.append(up)
             if filtered:
                 candidates = filtered
-        budget_deadline = time.monotonic() + max(0.0, float(getattr(self, "scan_budget", 8.0)))
-        for up in candidates:
-            if time.monotonic() > budget_deadline:
-                break
+        budget = float(getattr(self, "scan_budget", 8.0))
+        budget_deadline = time.monotonic() + max(0.0, budget)
+        fanout = max(1, int(os.getenv("PROXXY_PROXY_UPSTREAM_FANOUT", "2")))
+        idx = 0
+    
+        if _DIAG_ON:
             try:
-                up_r, up_w = await self._open_upstream(up)
+                logger.info(
+                    "tunnel[%s]: connect target=%s:%s candidates=%d skipped_ttl=%d fanout=%d budget_s=%.2f ttl=%.1f",
+                    cid, host, port, len(candidates), skipped_ttl, fanout, budget, self.failure_ttl
+                )
+            except Exception:
+                pass
+    
+        async def _try_connect(up: UpstreamProxy):
+            # Dial upstream and perform CONNECT handshake; return (ok, up_r, up_w, err, up)
+            dial_ms = 0.0
+            try:
+                t0 = time.monotonic()
+                up_r, up_w = await asyncio.wait_for(self._open_upstream(up), timeout=self.dial_timeout)
+                dial_ms = (time.monotonic() - t0) * 1000.0
             except Exception as e:
-                last_err = f"connect-upstream-failed {e}"
-                self._mark_fail(up)
-                continue
+                if _DIAG_ON:
+                    logger.info(
+                        "tunnel[%s]: attempt fail phase=dial upstream=%s://%s:%s auth=%s err=%s",
+                        cid, up.scheme, up.host, up.port, bool(up.username), e
+                    )
+                return False, None, None, f"connect-upstream-failed {e}", up
             try:
                 # Send CONNECT to upstream proxy
                 lines = [
@@ -382,17 +438,25 @@ class TunnelProxyServer:
                 data = ("\r\n".join(lines) + "\r\n\r\n").encode("latin1")
                 up_w.write(data)
                 await asyncio.wait_for(up_w.drain(), timeout=self.io_timeout)
-
+    
                 # Read upstream response
+                t1 = time.monotonic()
                 status_line = await asyncio.wait_for(up_r.readline(), timeout=self.io_timeout)
                 if not status_line:
-                    last_err = "empty-response"
-                    up_w.close()
                     try:
-                        await up_w.wait_closed()
+                        up_w.close()
+                        try:
+                            await up_w.wait_closed()
+                        except Exception:
+                            pass
                     except Exception:
                         pass
-                    continue
+                    if _DIAG_ON:
+                        logger.info(
+                            "tunnel[%s]: attempt fail phase=handshake upstream=%s://%s:%s auth=%s err=empty-response dial_ms=%.0f",
+                            cid, up.scheme, up.host, up.port, bool(up.username), dial_ms
+                        )
+                    return False, None, None, "empty-response", up
                 status = status_line.decode("latin1", "replace").strip()
                 code = self._parse_status_code(status)
                 # Drain headers
@@ -400,24 +464,30 @@ class TunnelProxyServer:
                     line = await asyncio.wait_for(up_r.readline(), timeout=self.io_timeout)
                     if not line or line in (b"\r\n", b"\n"):
                         break
+                hs_ms = (time.monotonic() - t1) * 1000.0
                 if code == 200:
-                    # Inform client and start piping
-                    self._clear_fail(up)
-                    await self._respond_raw(client_w, b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                    await self._pipe_bidirectional(client_r, client_w, up_r, up_w, bufsize=65536, idle_timeout=self.tunnel_idle_timeout)
-                    return
+                    if _DIAG_ON:
+                        logger.info(
+                            "tunnel[%s]: connect ok upstream=%s://%s:%s auth=%s dial_ms=%.0f hs_ms=%.0f",
+                            cid, up.scheme, up.host, up.port, bool(up.username), dial_ms, hs_ms
+                        )
+                    return True, up_r, up_w, "", up
                 else:
-                    last_err = f"upstream-status-{code}"
-                    self._mark_fail(up)
-                    up_w.close()
                     try:
-                        await up_w.wait_closed()
+                        up_w.close()
+                        try:
+                            await up_w.wait_closed()
+                        except Exception:
+                            pass
                     except Exception:
                         pass
-                    continue
+                    if _DIAG_ON:
+                        logger.info(
+                            "tunnel[%s]: attempt fail phase=handshake upstream=%s://%s:%s auth=%s status=%d dial_ms=%.0f hs_ms=%.0f",
+                            cid, up.scheme, up.host, up.port, bool(up.username), code, dial_ms, hs_ms
+                        )
+                    return False, None, None, f"upstream-status-{code}", up
             except Exception as e:
-                last_err = f"upstream-error {e}"
-                self._mark_fail(up)
                 try:
                     up_w.close()
                     try:
@@ -426,10 +496,104 @@ class TunnelProxyServer:
                         pass
                 except Exception:
                     pass
-                continue
-
+                if _DIAG_ON:
+                    logger.info(
+                        "tunnel[%s]: attempt fail phase=handshake upstream=%s://%s:%s auth=%s err=%s dial_ms=%.0f",
+                        cid, up.scheme, up.host, up.port, bool(up.username), e, dial_ms
+                    )
+                return False, None, None, f"upstream-error {e}", up
+    
+        while idx < len(candidates):
+            if time.monotonic() > budget_deadline:
+                break
+            batch = candidates[idx: idx + fanout]
+            idx += fanout
+            if not batch:
+                break
+            tasks = [asyncio.create_task(_try_connect(up)) for up in batch]
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    
+            # Check if any succeeded
+            success_tuple = None
+            for fut in done:
+                ok, up_r, up_w, err, up = fut.result()
+                if ok:
+                    success_tuple = (up_r, up_w, up)
+                    break
+                else:
+                    last_err = err
+                    self._mark_fail(up)
+    
+            if success_tuple is not None:
+                # Cancel remaining attempts
+                for t in pending:
+                    try:
+                        t.cancel()
+                    except Exception:
+                        pass
+                if pending:
+                    try:
+                        await asyncio.gather(*pending, return_exceptions=True)
+                    except Exception:
+                        pass
+                # Inform client and start piping
+                up_r, up_w, up = success_tuple
+                if up_r is None or up_w is None:
+                    # Defensive: should not happen since success_tuple implies non-None
+                    last_err = "internal-error: upstream streams absent"
+                    try:
+                        if up_w is not None:
+                            up_w.close()
+                            try:
+                                await up_w.wait_closed()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    continue
+                self._clear_fail(up)
+                await self._respond_raw(client_w, b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                if _DIAG_ON:
+                    logger.info(
+                        "tunnel[%s]: CONNECT established target=%s:%s via=%s://%s:%s",
+                        cid, host, port, up.scheme, up.host, up.port
+                    )
+                up_r_cast = cast(asyncio.StreamReader, up_r)
+                up_w_cast = cast(asyncio.StreamWriter, up_w)
+                t_pipe0 = time.monotonic()
+                await self._pipe_bidirectional(
+                    client_r,
+                    client_w,
+                    up_r_cast,
+                    up_w_cast,
+                    bufsize=65536,
+                    idle_timeout=self.tunnel_idle_timeout,
+                    cid=cid,
+                    label=f"CONNECT {host}:{port} via {up.scheme}://{up.host}:{up.port}",
+                )
+                dur_ms = (time.monotonic() - t_pipe0) * 1000.0
+                if _DIAG_ON:
+                    logger.info(
+                        "tunnel[%s]: CONNECT closed target=%s:%s via=%s://%s:%s dur_ms=%.0f",
+                        cid, host, port, up.scheme, up.host, up.port, dur_ms
+                    )
+                return
+    
+            # No success in this batch; cancel any still-pending and continue
+            for t in pending:
+                try:
+                    t.cancel()
+                except Exception:
+                    pass
+            if pending:
+                try:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                except Exception:
+                    pass
+            # continue to next batch
+    
         # No upstream succeeded
-        logger.warning("tunnel: CONNECT failed target=%s:%s err=%s", host, port, last_err)
+        logger.warning("tunnel[%s]: CONNECT failed target=%s:%s err=%s", cid, host, port, last_err)
         await self._respond(client_w, 502, "Bad Gateway")
 
     async def _handle_http(
@@ -442,6 +606,7 @@ class TunnelProxyServer:
         client_r: asyncio.StreamReader,
         client_w: asyncio.StreamWriter,
         sticky: Optional[UpstreamProxy] = None,
+        cid: Optional[str] = None,
     ) -> None:
         # Ensure absolute-form URI for upstream HTTP proxy
         if target.startswith("http://") or target.startswith("https://"):
@@ -449,10 +614,23 @@ class TunnelProxyServer:
         else:
             host = hdr_map.get("host", "")
             if not host:
+                if _DIAG_ON:
+                    logger.info("tunnel[%s]: reject reason=missing_host", cid)
                 await self._respond(client_w, 400, "Missing Host")
                 return
             # Default to http schema for origin-form
             abs_uri = f"http://{host}{target}"
+
+        # For diagnostics: extract authority/scheme (path redacted implicitly)
+        try:
+            u = urlsplit(abs_uri)
+            authority = u.netloc
+            scheme = (u.scheme or "").lower()
+        except Exception:
+            authority = "-"
+            scheme = "-"
+        if _DIAG_ON:
+            logger.info("tunnel[%s]: http_forward %s://%s method=%s ver=%s", cid, scheme, authority, method, version)
 
         attempts = self.max_retries + 1
         last_err: Optional[str] = None
@@ -471,7 +649,9 @@ class TunnelProxyServer:
             _seen_keys.add(_key)
             candidates.append(up)
         # Skip recently failed upstreams within TTL window (only if TTL > 0)
-        budget_deadline = time.monotonic() + max(0.0, float(getattr(self, "scan_budget", 8.0)))
+        budget = float(getattr(self, "scan_budget", 8.0))
+        budget_deadline = time.monotonic() + max(0.0, budget)
+        skipped_ttl = 0
         if self.failure_ttl > 0:
             now_ts = time.monotonic()
             filtered: List[UpstreamProxy] = []
@@ -479,22 +659,34 @@ class TunnelProxyServer:
                 _key = (up.scheme, up.host, up.port, up.username or "", up.password or "")
                 ts = self._failures.get(_key, 0.0)
                 if ts and (now_ts - ts) < self.failure_ttl:
+                    skipped_ttl += 1
                     continue
                 filtered.append(up)
             if filtered:
                 candidates = filtered
+        if _DIAG_ON:
+            logger.info(
+                "tunnel[%s]: http candidates=%d skipped_ttl=%d budget_s=%.2f",
+                cid, len(candidates), skipped_ttl, budget
+            )
         for up in candidates:
             if time.monotonic() > budget_deadline:
                 break
             try:
+                t0 = time.monotonic()
                 up_r, up_w = await self._open_upstream(up)
+                dial_ms = (time.monotonic() - t0) * 1000.0
             except Exception as e:
                 last_err = f"connect-upstream-failed {e}"
                 self._mark_fail(up)
+                if _DIAG_ON:
+                    logger.info(
+                        "tunnel[%s]: http attempt fail phase=dial upstream=%s://%s:%s auth=%s err=%s",
+                        cid, up.scheme, up.host, up.port, bool(up.username), e
+                    )
                 continue
             try:
-                # Build request to upstream
-                # Always speak HTTP/1.1 to upstream HTTP proxy regardless of client version
+                # Build request to upstream (speak HTTP/1.1 to upstream proxy)
                 out_lines: List[str] = [f"{method} {abs_uri} HTTP/1.1"]
                 # Rewrite headers: drop client Proxy-* headers and Connection, add our Proxy-Authorization if needed
                 for h in raw_headers:
@@ -513,9 +705,28 @@ class TunnelProxyServer:
                 up_w.write(data)
                 await asyncio.wait_for(up_w.drain(), timeout=self.io_timeout)
 
+                if _DIAG_ON:
+                    logger.info(
+                        "tunnel[%s]: http forward start upstream=%s://%s:%s auth=%s dial_ms=%.0f",
+                        cid, up.scheme, up.host, up.port, bool(up.username), dial_ms
+                    )
                 # After sending headers, relay bidirectionally (this supports bodies and simple keep-alive)
                 self._clear_fail(up)
-                await self._pipe_bidirectional(client_r, client_w, up_r, up_w)
+                t_pipe0 = time.monotonic()
+                await self._pipe_bidirectional(
+                    client_r,
+                    client_w,
+                    up_r,
+                    up_w,
+                    cid=cid,
+                    label=f"HTTP {scheme}://{authority} via {up.scheme}://{up.host}:{up.port}",
+                )
+                dur_ms = (time.monotonic() - t_pipe0) * 1000.0
+                if _DIAG_ON:
+                    logger.info(
+                        "tunnel[%s]: http forward closed upstream=%s://%s:%s dur_ms=%.0f",
+                        cid, up.scheme, up.host, up.port, dur_ms
+                    )
                 return
             except Exception as e:
                 last_err = f"upstream-error {e}"
@@ -528,9 +739,14 @@ class TunnelProxyServer:
                         pass
                 except Exception:
                     pass
+                if _DIAG_ON:
+                    logger.info(
+                        "tunnel[%s]: http attempt fail phase=forward upstream=%s://%s:%s auth=%s err=%s",
+                        cid, up.scheme, up.host, up.port, bool(up.username), e
+                    )
                 continue
 
-        logger.warning("tunnel: HTTP forward failed uri=%s err=%s", abs_uri, last_err)
+        logger.warning("tunnel[%s]: HTTP forward failed authority=%s err=%s", cid, authority, last_err)
         await self._respond(client_w, 502, "Bad Gateway")
 
     async def _pipe_bidirectional(
@@ -541,11 +757,24 @@ class TunnelProxyServer:
         b_w: asyncio.StreamWriter,
         bufsize: int = 65536,
         idle_timeout: Optional[float] = None,
+        cid: Optional[str] = None,
+        label: str = "",
     ) -> None:
-        async def pump(src: asyncio.StreamReader, dst: asyncio.StreamWriter) -> None:
+        """
+        Relay data in both directions until EOF/idle/cancel.
+        When diagnostics enabled and cid provided, logs a summary with byte counts and end reasons.
+        """
+        bytes_a2b = 0
+        bytes_b2a = 0
+        end_a = "-"
+        end_b = "-"
+
+        async def pump(name: str, src: asyncio.StreamReader, dst: asyncio.StreamWriter) -> Tuple[str, int, str]:
             # If idle_timeout <= 0, do not enforce a read timeout (prevents H2 CANCEL due to proxy idle close)
             tmo_val = self.io_timeout if idle_timeout is None else float(idle_timeout)
             use_timeout = tmo_val is not None and tmo_val > 0
+            total = 0
+            reason = "eof"
             try:
                 while True:
                     if use_timeout:
@@ -554,6 +783,7 @@ class TunnelProxyServer:
                         chunk = await src.read(bufsize)
                     if not chunk:
                         break
+                    total += len(chunk)
                     dst.write(chunk)
                     if use_timeout:
                         await asyncio.wait_for(dst.drain(), timeout=tmo_val)
@@ -561,28 +791,44 @@ class TunnelProxyServer:
                         await dst.drain()
             except asyncio.TimeoutError:
                 # Idle timeout; simply unwind; no half-close on tunnel
-                pass
+                reason = "timeout"
             except Exception:
-                pass
+                reason = "error"
             finally:
                 # Do not write_eof() on tunnels; it can break TLS/H2 streams
-                pass
+                return name, total, reason
 
-        t1 = asyncio.create_task(pump(a_r, b_w))
-        t2 = asyncio.create_task(pump(b_r, a_w))
+        t1 = asyncio.create_task(pump("a->b", a_r, b_w))
+        t2 = asyncio.create_task(pump("b->a", b_r, a_w))
         try:
             # When one direction finishes (EOF/idle), cancel the peer pump to avoid lingering pending tasks
             done, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
+            results: List[Tuple[str, int, str]] = []
+            for fut in done:
+                try:
+                    results.append(await fut)
+                except Exception:
+                    pass
             for t in pending:
                 try:
                     t.cancel()
                 except Exception:
                     pass
-            # Ensure cancellation is observed
-            try:
-                await asyncio.gather(*pending, return_exceptions=True)
-            except Exception:
-                pass
+            if pending:
+                try:
+                    pending_results = await asyncio.gather(*pending, return_exceptions=True)
+                    for r in pending_results:
+                        if isinstance(r, tuple) and len(r) == 3:
+                            results.append(r)  # type: ignore[arg-type]
+                except Exception:
+                    pass
+            for name, total, reason in results:
+                if name == "a->b":
+                    bytes_a2b = total
+                    end_a = reason
+                elif name == "b->a":
+                    bytes_b2a = total
+                    end_b = reason
         except asyncio.CancelledError:
             # If the handler is cancelled, ensure both pump tasks are cancelled and awaited
             try:
@@ -610,6 +856,15 @@ class TunnelProxyServer:
             for w in (a_w, b_w):
                 try:
                     await asyncio.wait_for(w.wait_closed(), timeout=1.0)
+                except Exception:
+                    pass
+            # Summary logging
+            if _DIAG_ON and cid is not None:
+                try:
+                    logger.info(
+                        "tunnel[%s]: pipe_summary label=%s a2b=%d b2a=%d end=%s|%s",
+                        cid, (label or "-"), bytes_a2b, bytes_b2a, end_a, end_b
+                    )
                 except Exception:
                     pass
 
