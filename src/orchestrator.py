@@ -154,31 +154,46 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
             completed_count = 0
             last_progress_emit = time.monotonic()
             batch: List[str] = []
+            # Flush to pool early so proxy can start once min_upstreams are available
+            flush_threshold = max(1, int(getattr(cfg, "min_upstreams", 10)))
+            last_flush_ts = time.monotonic()
 
             def _flush_batch():
-                nonlocal batch, publish_size, published
+                nonlocal batch, publish_size, published, last_flush_ts
                 if not batch:
                     return
+                to_send = list(batch)
                 if pool_queue is not None:
                     try:
-                        pool_queue.put({"type": "add", "proxies": list(batch)}, timeout=0.1)
+                        pool_queue.put({"type": "add", "proxies": to_send}, timeout=0.1)
                     except Exception:
                         try:
-                            for i in range(0, len(batch), 2000):
-                                pool_queue.put({"type": "add", "proxies": batch[i:i+2000]}, timeout=0.1)
+                            for i in range(0, len(to_send), 2000):
+                                pool_queue.put({"type": "add", "proxies": to_send[i:i+2000]}, timeout=0.1)
                         except Exception:
                             pass
-                body_bytes = len(("\n".join(batch) + "\n").encode("utf-8"))
+                body_bytes = len(("\n".join(to_send) + "\n").encode("utf-8"))
                 publish_size += body_bytes
                 published = True
+                # Emit publish flush event for status display
+                try:
+                    emit({"type": "publish_flush", "bytes": int(body_bytes), "count": int(len(to_send)), "ts": time.time()})
+                except Exception:
+                    pass
                 batch.clear()
+                last_flush_ts = time.monotonic()
 
             def _on_live(pxy: str, details: dict) -> None:
-                nonlocal live_count
+                nonlocal live_count, last_flush_ts
                 live_count += 1
                 batch.append(pxy)
-                if len(batch) >= 200:
+                if len(batch) >= flush_threshold:
                     _flush_batch()
+                else:
+                    # time-based flush to keep pool warm
+                    now = time.monotonic()
+                    if (now - last_flush_ts) >= 1.0:
+                        _flush_batch()
 
             def _on_result(details: dict) -> None:
                 nonlocal completed_count, last_progress_emit
