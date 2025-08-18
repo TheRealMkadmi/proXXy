@@ -270,6 +270,9 @@ class PoolManager:
         self._prune_thread = threading.Thread(target=self._prune_loop, name="pool-prune", daemon=True)
         self._recheck_thread: Optional[threading.Thread] = None
         self._sess: Optional[requests.Session] = None
+        # Recheck strike tracking to avoid removing on single transient failure
+        self._recheck_strikes: Dict[str, int] = {}
+        self._recheck_strike_threshold = int(os.getenv("PROXXY_POOL_RECHECK_STRIKES", "2"))
 
     # Lifecycle
     def start(self) -> None:
@@ -371,7 +374,10 @@ class PoolManager:
     def _recheck_one(self, pxy: str, sess: requests.Session, health_url: str) -> Tuple[str, bool]:
         try:
             proxies = {"http": pxy, "https": pxy}
-            resp = sess.get(health_url, proxies=proxies, timeout=float(self.cfg.recheck_timeout), stream=True, allow_redirects=True)
+            # Use separate connect/read timeouts for recheck to be tolerant of slow reads but fail fast on connect
+            connect_to = float(os.getenv("PROXXY_POOL_RECHECK_CONNECT_TIMEOUT", "1.8"))
+            read_to = float(os.getenv("PROXXY_POOL_RECHECK_READ_TIMEOUT", "4.0"))
+            resp = sess.get(health_url, proxies=proxies, timeout=(connect_to, read_to), stream=True, allow_redirects=True)
             # Tunables (fallback to validator defaults; softened to mirror validator)
             min_bytes = int(os.getenv("PROXXY_POOL_RECHECK_MIN_BYTES", os.getenv("PROXXY_VALIDATOR_MIN_BYTES", "1024")))
             read_window = float(os.getenv("PROXXY_POOL_RECHECK_READ_SECONDS", os.getenv("PROXXY_VALIDATOR_READ_SECONDS", "2.5")))
@@ -430,9 +436,20 @@ class PoolManager:
                     _, ok = self._recheck_one(pxy, sess, health_url)
                     if ok:
                         ok_count += 1
+                        try:
+                            self._recheck_strikes.pop(pxy, None)
+                        except Exception:
+                            pass
                     else:
-                        if self.pool.remove(pxy):
-                            removed += 1
+                        cnt = int(self._recheck_strikes.get(pxy, 0)) + 1
+                        self._recheck_strikes[pxy] = cnt
+                        if cnt >= int(self._recheck_strike_threshold):
+                            if self.pool.remove(pxy):
+                                removed += 1
+                            try:
+                                self._recheck_strikes.pop(pxy, None)
+                            except Exception:
+                                pass
                 if removed:
                     self.file_sync.schedule()
                 if removed or ok_count:

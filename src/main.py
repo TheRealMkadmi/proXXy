@@ -147,10 +147,10 @@ def main() -> int:
                 ttl_seconds=getattr(cfg, "pool_ttl_seconds", 900),
                 prune_interval_seconds=getattr(cfg, "pool_prune_interval_seconds", 30),
                 health_check_url=cfg.validation_url,
-                # More aggressive pool hygiene: faster recheck and higher throughput
-                recheck_timeout=1.0,          # was 2.5
-                recheck_per_interval=1000,    # was 200
-                recheck_workers=64,           # was 16
+                # Softer recheck: higher tolerance and smaller per-interval sample
+                recheck_timeout=2.5,
+                recheck_per_interval=300,
+                recheck_workers=32,
                 enable_recheck=True,
             )
         )
