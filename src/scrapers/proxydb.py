@@ -65,51 +65,102 @@ class ProxyDBScraper:
             return f"{ip}:{port}"
         return None
 
-    def scrape(self) -> List[str]:
-        from requests import get
+    def _extract_from_html(self, html: str) -> List[str]:
         try:
-            from parsel import Selector
+            from parsel import Selector  # type: ignore
         except Exception:
             Selector = None  # type: ignore
 
         out: List[str] = []
-        seen = set()
+        seen_local = set()
+        if not html:
+            return out
+
+        if Selector is not None:
+            try:
+                sel = Selector(text=html)
+                rows = sel.css("table tbody tr")
+                if not rows:
+                    rows = sel.css("table tr")
+                for r in rows:
+                    item = self._extract_from_row(r)
+                    if item and item not in seen_local:
+                        seen_local.add(item)
+                        out.append(item)
+            except Exception:
+                pass
+
+        # Fallback or supplement via regex pattern scan
+        if not out:
+            for m in PROXY_PATTERN.finditer(html):
+                val = m.group(0)
+                if val not in seen_local:
+                    seen_local.add(val)
+                    out.append(val)
+
+        return out
+
+    def scrape(self) -> List[str]:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import math
+        import re
+        import requests
 
         headers = {"User-Agent": self.user_agent} if self.user_agent else None
 
         # ProxyDB paginates in steps of 30
         step = 30
-        for i in range(self.pages):
-            offset = i * step
+
+        def fetch(offset: int) -> str:
             url = self._build_url(offset=offset)
             try:
-                resp = get(url, headers=headers, timeout=self.timeout, verify=self.verify_ssl)
-                if resp.status_code < 200 or resp.status_code >= 400:
-                    continue
-                html = resp.text or ""
-                if not html:
-                    continue
-                if Selector is None:
-                    continue
-                sel = Selector(text=html)
-                rows = sel.css("table tbody tr")
-                if not rows:
-                    # Try a broader selection if tbody missing
-                    rows = sel.css("table tr")
-                before = len(out)
-                for r in rows:
-                    item = self._extract_from_row(r)
-                    if item and item not in seen:
-                        seen.add(item)
-                        out.append(item)
-                # Fallback: regex scan if table extraction failed to yield anything new
-                if len(out) == before:
-                    for m in PROXY_PATTERN.finditer(html):
-                        val = m.group(0)
-                        if val not in seen:
-                            seen.add(val)
-                            out.append(val)
+                resp = requests.get(url, headers=headers, timeout=self.timeout, verify=self.verify_ssl)
+                if 200 <= resp.status_code < 400:
+                    return resp.text or ""
             except Exception:
-                continue
+                pass
+            return ""
 
-        return out
+        # First: fetch page 1 (offset 0)
+        first_html = fetch(0)
+        results: List[str] = []
+        seen: set[str] = set()
+
+        # Extract from first page
+        for item in self._extract_from_html(first_html):
+            if item not in seen:
+                seen.add(item)
+                results.append(item)
+
+        # Try to parse total proxies, e.g.: "Showing 1 to 30 of 2,345 total proxies"
+        total_count: Optional[int] = None
+        if first_html:
+            m = re.search(r"Showing\s+\d+\s+to\s+\d+\s+of\s+([0-9,]+)\s+total\s+proxies", first_html, flags=re.IGNORECASE)
+            if m:
+                try:
+                    total_count = int(m.group(1).replace(",", ""))
+                except Exception:
+                    total_count = None
+
+        # Determine how many pages to fetch. If total_count parsed, ignore self.pages to return full dataset.
+        if total_count is not None and total_count > 0:
+            total_pages = max(1, math.ceil(total_count / step))
+        else:
+            total_pages = max(1, int(self.pages))
+
+        # Prepare remaining offsets (we already fetched offset 0)
+        remaining_offsets = [i * step for i in range(1, total_pages)]
+        if remaining_offsets:
+            max_workers = min(16, max(1, len(remaining_offsets)))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {executor.submit(fetch, off): off for off in remaining_offsets}
+                for fut in as_completed(future_map):
+                    html = fut.result() or ""
+                    if not html:
+                        continue
+                    for item in self._extract_from_html(html):
+                        if item not in seen:
+                            seen.add(item)
+                            results.append(item)
+
+        return results
