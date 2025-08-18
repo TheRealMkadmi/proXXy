@@ -372,16 +372,17 @@ class PoolManager:
         try:
             proxies = {"http": pxy, "https": pxy}
             resp = sess.get(health_url, proxies=proxies, timeout=float(self.cfg.recheck_timeout), stream=True, allow_redirects=True)
-            # Tunables (fallback to validator defaults)
-            min_bytes = int(os.getenv("PROXXY_POOL_RECHECK_MIN_BYTES", os.getenv("PROXXY_VALIDATOR_MIN_BYTES", "2048")))
-            read_window = float(os.getenv("PROXXY_POOL_RECHECK_READ_SECONDS", os.getenv("PROXXY_VALIDATOR_READ_SECONDS", "1.0")))
-            ttfb = float(os.getenv("PROXXY_POOL_RECHECK_TTFB_SECONDS", os.getenv("PROXXY_VALIDATOR_TTFB_SECONDS", "0.8")))
+            # Tunables (fallback to validator defaults; softened to mirror validator)
+            min_bytes = int(os.getenv("PROXXY_POOL_RECHECK_MIN_BYTES", os.getenv("PROXXY_VALIDATOR_MIN_BYTES", "1024")))
+            read_window = float(os.getenv("PROXXY_POOL_RECHECK_READ_SECONDS", os.getenv("PROXXY_VALIDATOR_READ_SECONDS", "2.5")))
+            ttfb = float(os.getenv("PROXXY_POOL_RECHECK_TTFB_SECONDS", os.getenv("PROXXY_VALIDATOR_TTFB_SECONDS", "2.0")))
+            chunk_size = int(os.getenv("PROXXY_POOL_RECHECK_CHUNK_SIZE", os.getenv("PROXXY_VALIDATOR_CHUNK_SIZE", "8192")))
             total = 0
             t_start = time.monotonic()
             seen = False
             read_error = False
             try:
-                for chunk in resp.iter_content(chunk_size=2048):
+                for chunk in resp.iter_content(chunk_size=max(1, int(chunk_size))):
                     now = time.monotonic()
                     # First byte deadline
                     if not seen and (now - t_start) >= ttfb:

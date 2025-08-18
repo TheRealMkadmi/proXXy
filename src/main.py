@@ -86,7 +86,7 @@ def main() -> int:
     # - Try more upstream proxies before giving up a client request
     # - Quicker dial timeout to fail fast and move to next upstream
     os.environ.setdefault("PROXXY_PROXY_UPSTREAM_RETRIES", "6")   # default was 2
-    os.environ.setdefault("PROXXY_PROXY_DIAL_TIMEOUT", "1.5")     # seconds (default 3.0)
+    os.environ.setdefault("PROXXY_PROXY_DIAL_TIMEOUT", "1.8")     # seconds (fail fast; try more upstreams)
 
 
     # Health checks use the validation URL; no separate flag

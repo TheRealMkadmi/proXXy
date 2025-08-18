@@ -175,6 +175,13 @@ class TunnelProxyServer:
         self.max_line_bytes = int(max_line_bytes)
         self.max_retries = max(0, int(os.getenv("PROXXY_PROXY_UPSTREAM_RETRIES", str(max_retries))))
         self._server: Optional[asyncio.AbstractServer] = None
+        # Failure backoff cache for upstream selection (skip recently failed endpoints)
+        self.failure_ttl = float(os.getenv("PROXXY_PROXY_UPSTREAM_FAILURE_TTL", "30"))
+        # Key: (scheme, host, port, username, password)
+        self._failures: Dict[Tuple[str, str, int, str, str], float] = {}
+        # Candidate scan controls per client request
+        self.scan_max = int(os.getenv("PROXXY_PROXY_UPSTREAM_SCAN_MAX", "50"))
+        self.scan_budget = float(os.getenv("PROXXY_PROXY_UPSTREAM_SCAN_BUDGET", "8.0"))
 
     async def start(self) -> None:
         self._server = await asyncio.start_server(self._handle_client, self.host, self.port, start_serving=True)
@@ -305,12 +312,42 @@ class TunnelProxyServer:
 
         attempts = self.max_retries + 1
         last_err: Optional[str] = None
-        candidates: List[UpstreamProxy] = ([sticky] if sticky is not None else self.pool.next_many(attempts)) or []
+        # Build candidate list: prefer sticky, then extras to honor retries
+        _cand: List[UpstreamProxy] = []
+        if sticky is not None:
+            _cand.append(sticky)
+        _extras = self.pool.next_many(max(attempts, min(self.pool.size(), int(getattr(self, "scan_max", 20)))))
+        # Deduplicate by endpoint + credentials
+        _seen_keys = set()
+        candidates: List[UpstreamProxy] = []
+        for up in (_cand + _extras):
+            if up is None:
+                continue
+            _key = (up.scheme, up.host, up.port, up.username or "", up.password or "")
+            if _key in _seen_keys:
+                continue
+            _seen_keys.add(_key)
+            candidates.append(up)
+        # Skip recently failed upstreams within TTL window
+        now_ts = time.monotonic()
+        filtered: List[UpstreamProxy] = []
         for up in candidates:
+            _key = (up.scheme, up.host, up.port, up.username or "", up.password or "")
+            ts = self._failures.get(_key, 0.0)
+            if ts and (now_ts - ts) < self.failure_ttl:
+                continue
+            filtered.append(up)
+        if filtered:
+            candidates = filtered
+        budget_deadline = time.monotonic() + max(0.0, float(getattr(self, "scan_budget", 8.0)))
+        for up in candidates:
+            if time.monotonic() > budget_deadline:
+                break
             try:
                 up_r, up_w = await self._open_upstream(up)
             except Exception as e:
                 last_err = f"connect-upstream-failed {e}"
+                self._mark_fail(up)
                 continue
             try:
                 # Send CONNECT to upstream proxy
@@ -318,6 +355,7 @@ class TunnelProxyServer:
                     f"CONNECT {host}:{port} HTTP/1.1",
                     f"Host: {host}:{port}",
                     "Proxy-Connection: keep-alive",
+                    "Connection: keep-alive",
                 ]
                 auth = up.auth_header_value()
                 if auth:
@@ -345,11 +383,13 @@ class TunnelProxyServer:
                         break
                 if code == 200:
                     # Inform client and start piping
+                    self._clear_fail(up)
                     await self._respond_raw(client_w, b"HTTP/1.1 200 Connection Established\r\n\r\n")
                     await self._pipe_bidirectional(client_r, client_w, up_r, up_w)
                     return
                 else:
                     last_err = f"upstream-status-{code}"
+                    self._mark_fail(up)
                     up_w.close()
                     try:
                         await up_w.wait_closed()
@@ -358,6 +398,7 @@ class TunnelProxyServer:
                     continue
             except Exception as e:
                 last_err = f"upstream-error {e}"
+                self._mark_fail(up)
                 try:
                     up_w.close()
                     try:
@@ -396,12 +437,42 @@ class TunnelProxyServer:
 
         attempts = self.max_retries + 1
         last_err: Optional[str] = None
-        candidates: List[UpstreamProxy] = ([sticky] if sticky is not None else self.pool.next_many(attempts)) or []
+        # Build candidate list: prefer sticky, then extras to honor retries
+        _cand: List[UpstreamProxy] = []
+        if sticky is not None:
+            _cand.append(sticky)
+        _extras = self.pool.next_many(max(attempts, min(self.pool.size(), int(getattr(self, "scan_max", 20)))))
+        # Deduplicate by endpoint + credentials
+        _seen_keys = set()
+        candidates: List[UpstreamProxy] = []
+        for up in (_cand + _extras):
+            if up is None:
+                continue
+            _key = (up.scheme, up.host, up.port, up.username or "", up.password or "")
+            if _key in _seen_keys:
+                continue
+            _seen_keys.add(_key)
+            candidates.append(up)
+        # Skip recently failed upstreams within TTL window
+        now_ts = time.monotonic()
+        filtered: List[UpstreamProxy] = []
+        budget_deadline = time.monotonic() + max(0.0, float(getattr(self, "scan_budget", 8.0)))
         for up in candidates:
+            _key = (up.scheme, up.host, up.port, up.username or "", up.password or "")
+            ts = self._failures.get(_key, 0.0)
+            if ts and (now_ts - ts) < self.failure_ttl:
+                continue
+            filtered.append(up)
+        if filtered:
+            candidates = filtered
+        for up in candidates:
+            if time.monotonic() > budget_deadline:
+                break
             try:
                 up_r, up_w = await self._open_upstream(up)
             except Exception as e:
                 last_err = f"connect-upstream-failed {e}"
+                self._mark_fail(up)
                 continue
             try:
                 # Build request to upstream
@@ -423,10 +494,12 @@ class TunnelProxyServer:
                 await asyncio.wait_for(up_w.drain(), timeout=self.io_timeout)
 
                 # After sending headers, relay bidirectionally (this supports bodies and simple keep-alive)
+                self._clear_fail(up)
                 await self._pipe_bidirectional(client_r, client_w, up_r, up_w)
                 return
             except Exception as e:
                 last_err = f"upstream-error {e}"
+                self._mark_fail(up)
                 try:
                     up_w.close()
                     try:
@@ -501,6 +574,14 @@ class TunnelProxyServer:
         ssl_ctx: Optional[ssl.SSLContext] = None
         if up.scheme == "https":
             ssl_ctx = ssl.create_default_context()
+            # Optional TLS verification against upstream proxies (default off)
+            try:
+                verify_up = os.getenv("PROXXY_PROXY_UPSTREAM_SSL_VERIFY", "0").strip().lower() not in ("0", "false", "no", "off")
+                if not verify_up:
+                    ssl_ctx.check_hostname = False
+                    ssl_ctx.verify_mode = ssl.CERT_NONE
+            except Exception:
+                pass
             # Force HTTP/1.1 to upstream proxies to avoid ALPN negotiating HTTP/2,
             # since we emit HTTP/1.1 proxy semantics on this connection.
             try:
@@ -536,6 +617,20 @@ class TunnelProxyServer:
         except Exception:
             pass
         return 0
+
+    def _mark_fail(self, up: UpstreamProxy) -> None:
+        try:
+            key = (up.scheme, up.host, up.port, up.username or "", up.password or "")
+            self._failures[key] = time.monotonic()
+        except Exception:
+            pass
+
+    def _clear_fail(self, up: UpstreamProxy) -> None:
+        try:
+            key = (up.scheme, up.host, up.port, up.username or "", up.password or "")
+            self._failures.pop(key, None)
+        except Exception:
+            pass
 
 
 def run_tunnel_proxy(
