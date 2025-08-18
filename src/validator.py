@@ -32,16 +32,16 @@ OnLiveFn = Callable[[str, Dict[str, Any]], None]
 OnResultFn = Callable[[Dict[str, Any]], None]
 
 # Minimal downloaded bytes to consider success (default 1; tune via env)
-_MIN_BYTES = int(os.getenv("PROXXY_VALIDATOR_MIN_BYTES", "4096"))
+_MIN_BYTES = int(os.getenv("PROXXY_VALIDATOR_MIN_BYTES", "1024"))
 
 
 # Enforced per-request timeout (seconds) applied to all proxy validations
 _ENFORCED_TIMEOUT_SECONDS = 25.0
 
 # Aggressive streaming reader tunables
-_READ_WINDOW_SECONDS = float(os.getenv("PROXXY_VALIDATOR_READ_SECONDS", "1.0"))
-_CHUNK_SIZE = int(os.getenv("PROXXY_VALIDATOR_CHUNK_SIZE", "2048"))
-_TTFB_SECONDS = float(os.getenv("PROXXY_VALIDATOR_TTFB_SECONDS", "0.8"))
+_READ_WINDOW_SECONDS = float(os.getenv("PROXXY_VALIDATOR_READ_SECONDS", "2.5"))
+_CHUNK_SIZE = int(os.getenv("PROXXY_VALIDATOR_CHUNK_SIZE", "8192"))
+_TTFB_SECONDS = float(os.getenv("PROXXY_VALIDATOR_TTFB_SECONDS", "2.0"))
 _DEFAULT_UA = os.getenv("PROXXY_VALIDATOR_USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 _TCP_PREFLIGHT = os.getenv("PROXXY_VALIDATOR_TCP_PREFLIGHT", "1")
 # Optional second URL to improve stability testing (falls back to primary when unset)
@@ -49,13 +49,13 @@ _SECOND_URL = os.getenv("PROXXY_VALIDATOR_SECOND_URL", "").strip()
 # Connection phase timeout (connect), kept <= enforced overall timeout
 _CONNECT_TIMEOUT_SECONDS = float(os.getenv("PROXXY_VALIDATOR_CONNECT_TIMEOUT", "3.0"))
 # Re-check (2nd pass) read window
-_RECHECK_READ_SECONDS = float(os.getenv("PROXXY_VALIDATOR_RECHECK_READ_SECONDS", "0.8"))
+_RECHECK_READ_SECONDS = float(os.getenv("PROXXY_VALIDATOR_RECHECK_READ_SECONDS", "1.5"))
 # Minimum sustained throughput after first byte (bytes/sec)
-_MIN_BPS = int(os.getenv("PROXXY_VALIDATOR_MIN_BPS", "16384"))
+_MIN_BPS = int(os.getenv("PROXXY_VALIDATOR_MIN_BPS", "4096"))
 # Require HTTP/1.1 response on validated fetch (some HTTP/1.0 paths are flaky)
-_REQUIRE_HTTP11 = os.getenv("PROXXY_VALIDATOR_REQUIRE_HTTP11", "1")
+_REQUIRE_HTTP11 = os.getenv("PROXXY_VALIDATOR_REQUIRE_HTTP11", "0")
 # OS trust TLS preflight via system CA store (replicates Schannel/curl behavior)
-_OS_TRUST_PREFLIGHT = os.getenv("PROXXY_VALIDATOR_OS_TRUST_PREFLIGHT", "1")
+_OS_TRUST_PREFLIGHT = os.getenv("PROXXY_VALIDATOR_OS_TRUST_PREFLIGHT", "0")
 
 # Global pool size (tuned per workers unless explicitly set via env)
 _POOL_SIZE = int(os.getenv("PROXXY_VALIDATOR_POOL_SIZE", "256"))
@@ -76,7 +76,7 @@ _FAIL_LOG_EVERY = max(1, int(os.getenv("PROXXY_VALIDATOR_FAIL_LOG_EVERY", "1")))
 _fail_log_counter = 0
 
 # Double-check sampling
-_DOUBLE_CHECK_RATIO = float(os.getenv("PROXXY_VALIDATOR_DOUBLE_CHECK_RATIO", "0.25"))
+_DOUBLE_CHECK_RATIO = float(os.getenv("PROXXY_VALIDATOR_DOUBLE_CHECK_RATIO", "0.1"))
 
 def _os_trust_tls_preflight(proxy: str, url: str) -> Tuple[bool, str]:
     """
@@ -247,23 +247,9 @@ def _check_one_requests(
         )
         # Content-Length early exit
         try:
-            cl = resp.headers.get("Content-Length")
-            if cl is not None and str(cl).isdigit() and int(cl) < max(1, _MIN_BYTES):
-                try:
-                    elapsed_tmp = float(resp.elapsed.total_seconds()) if resp.elapsed is not None else None
-                except Exception:
-                    elapsed_tmp = None
-                final_url_tmp = resp.url
-                status_tmp = resp.status_code
-                resp.close()
-                return (
-                    proxy,
-                    False,
-                    status_tmp,
-                    f"content_length<{_MIN_BYTES}",
-                    elapsed_tmp,
-                    final_url_tmp,
-                )
+            # Do not early-fail on small Content-Length; compressed bodies can inflate after decoding.
+            # Proceed to read and validate based on actual bytes read.
+            _ = resp.headers.get("Content-Length")
         except Exception:
             pass
         total = 0
@@ -330,17 +316,13 @@ def _check_one_requests(
         tokens_ok = True
         try:
             want = WANT_TOKENS[:] if WANT_TOKENS else []
-            if not want:
-                uhost = (url or "").lower()
-                if "netflix.com" in uhost:
-                    want = ["netflix"]
             if want:
                 text = bytes(sample_buf).decode("utf-8", errors="ignore").lower()
                 tokens_ok = all(tok in text for tok in want)
         except Exception:
             tokens_ok = True  # don't fail solely on token parsing
 
-        ok = status_ok and (total >= min_bytes) and (not read_error) and speed_ok and version_ok and tokens_ok
+        ok = status_ok and (total >= min_bytes) and (not read_error) and version_ok and tokens_ok
         try:
             elapsed = float(resp.elapsed.total_seconds()) if resp.elapsed is not None else None
         except Exception:
@@ -382,7 +364,6 @@ def _check_one_requests(
                     timeout=getattr(sess2, "request_timeout", (_ENFORCED_TIMEOUT_SECONDS, _ENFORCED_TIMEOUT_SECONDS)),
                     stream=True,
                     allow_redirects=True,
-                    headers={"Connection": "close"},
                 )
                 total2 = 0
                 start2 = time.monotonic()
@@ -440,17 +421,13 @@ def _check_one_requests(
                 tokens2_ok = True
                 try:
                     want2 = WANT_TOKENS[:] if WANT_TOKENS else []
-                    if not want2:
-                        uhost2 = (target2 or "").lower()
-                        if "netflix.com" in uhost2:
-                            want2 = ["netflix"]
                     if want2:
                         text2 = bytes(sample2).decode("utf-8", errors="ignore").lower()
                         tokens2_ok = all(tok in text2 for tok in want2)
                 except Exception:
                     tokens2_ok = True
 
-                if not (status2_ok and total2 >= min_bytes2 and (not read_error2) and speed2_ok and version2_ok and tokens2_ok):
+                if not (status2_ok and total2 >= min_bytes2 and (not read_error2) and version2_ok and tokens2_ok):
                     ok = False
                 resp2.close()
                 try:

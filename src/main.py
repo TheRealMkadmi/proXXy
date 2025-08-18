@@ -61,9 +61,9 @@ def main() -> int:
     args = _parse_cli_args()
     cli_to_env = {
         "output_dir": "PROXXY_OUTPUT_DIR",
-    "validation_url": "PROXXY_VALIDATION_URL",
-    "validator_workers": "PROXXY_VALIDATOR_WORKERS",
-    "validator_timeout": "PROXXY_VALIDATOR_TIMEOUT",
+        "validation_url": "PROXXY_VALIDATION_URL",
+        "validator_workers": "PROXXY_VALIDATOR_WORKERS",
+        "validator_timeout": "PROXXY_VALIDATOR_TIMEOUT",
         "proxy_host": "PROXXY_PROXY_HOST",
         "proxy_port": "PROXXY_PROXY_PORT",
         "proxy_log_level": "PROXXY_PROXY_LOG_LEVEL",
@@ -73,8 +73,8 @@ def main() -> int:
         "pool_debounce_ms": "PROXXY_POOL_DEBOUNCE_MS",
         "pool_ttl_seconds": "PROXXY_POOL_TTL_SECONDS",
         "pool_prune_interval_seconds": "PROXXY_POOL_PRUNE_INTERVAL_SECONDS",
-    # Pool recheck flags removed
-    "min_upstreams": "PROXXY_MIN_UPSTREAMS",
+        # Pool recheck flags removed
+        "min_upstreams": "PROXXY_MIN_UPSTREAMS",
         # Pass-through for dependent components
         "scraper_log_level": "PROXXY_SCRAPER_LOG_LEVEL",
     }
