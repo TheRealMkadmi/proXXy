@@ -97,6 +97,30 @@ options:
 - Proxy sorting instead of hardcoding.
 - Discerning between Elite, Anonymous, and Transparent anonymity classes of proxies.
 
+---
+
+## Advanced: Scraping Architecture
+
+- Scrapers: The orchestrator runs pluggable scrapers under `src/scrapers/`.
+  - `StaticUrlTextScraper` reads `proxy_sources.json` and extracts `IP:PORT` via `scrapers/extractors/TextExtractor`.
+  - `DynamicHtmlScraper` is a protocol for site-specific implementations (e.g., ProxyDB) that return `IP:PORT` lists.
+- Extractors: Reusable extractors live in `src/scrapers/extractors/` with `TextExtractor` and `HtmlExtractor`.
+- Source schema: `proxy_sources.json` continues to accept the old format, e.g.:
+  - `{ "HTTP": ["https://example.com/http.txt"], "HTTPS": ["..."] }`
+  You can also use rich entries per URL:
+
+```json
+{
+  "HTTP": [
+    "https://example.com/http.txt",
+    { "url": "https://example.com/proxies.html", "type": "html", "selectors": ["table#proxies", "//div[@id='list']"] }
+  ],
+  "HTTPS": ["https://example.com/https.txt"]
+}
+```
+
+If `type` is omitted, it will be inferred from the URL extension or the presence of `selectors`.
+
 ## Support
 
 Need help and can't get it to run correctly? Open an issue or contact me [here](https://solanaceae.xyz/).

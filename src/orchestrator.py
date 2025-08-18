@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import os
-import subprocess
 import sys
 import threading
 import time
@@ -12,6 +11,7 @@ from typing import List, Optional
 from .config import OrchestratorConfig, load_config_from_env
 from .proxy_server import run_tunnel_proxy
 from .validator import check_proxies_stream
+from .scrapers import StaticUrlTextScraper, ProxyDBScraper
 
 logger = logging.getLogger("proXXy.orchestrator")
 
@@ -58,65 +58,44 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
         scrape_dt = 0.0
         validate_dt = 0.0
 
-        # 1) Scrape via subprocess; writes HTTP/HTTPS files
+        # 1) Scrape using pluggable scrapers (in-memory aggregation)
+        proxies_all: List[str] = []
         try:
-            logger.info("scrape: starting (subprocess)")
+            logger.info("scrape: starting (in-process, pluggable)")
             t0 = time.perf_counter()
-            scraper_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), "scraper.py")
-            scr_cmd = [
-                sys.executable, scraper_path,
-                "--protocols", "HTTP,HTTPS",
-                "--output-dir", cfg.output_dir,
-                "--timeout", "5",
-                "--retry-times", "1",
-                "--log-level", os.environ.get("PROXXY_SCRAPER_LOG_LEVEL", "WARNING"),
+            scrapers = [
+                StaticUrlTextScraper(protocols=("HTTP", "HTTPS")),
+                ProxyDBScraper(protocol="http", anon_levels=(2, 4), country="", pages=1),
             ]
-            cp = subprocess.run(scr_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            seen = set()
+            for s in scrapers:
+                items = s.scrape()
+                for p in items:
+                    if p not in seen:
+                        seen.add(p)
+                        proxies_all.append(p)
             scrape_dt = time.perf_counter() - t0
-            if cp.returncode != 0:
-                logger.error("scrape: subprocess failed rc=%s stderr=%s", cp.returncode, (cp.stderr or "").strip())
-            else:
-                try:
-                    import json as _json
-                    data = _json.loads((cp.stdout or "").strip() or "{}")
-                    scrape_total = int(data.get("total") or 0)
-                except Exception:
-                    scrape_total = 0
-                logger.info("scrape: done rc=%s in %.2fs", cp.returncode, scrape_dt)
+            scrape_total = len(proxies_all)
+            logger.info("scrape: done in %.2fs total=%d", scrape_dt, scrape_total)
         except Exception as e:
             logger.exception("scrape: failed: %s", e)
 
-        # 2) Collect proxies from output files (HTTP/HTTPS), prefix scheme
+        # 2) Normalize to HTTP/HTTPS URL forms for validator
         candidates: List[str] = []
         try:
-            def _read_lines(path: str) -> List[str]:
-                out: List[str] = []
-                try:
-                    with open(path, "r", encoding="utf-8") as f:
-                        for ln in f:
-                            s = ln.strip()
-                            if s and not s.startswith("#"):
-                                out.append(s)
-                except Exception:
-                    pass
-                return out
-
-            http_path = os.path.join(cfg.output_dir, "HTTP.txt")
-            https_path = os.path.join(cfg.output_dir, "HTTPS.txt")
-            for raw, scheme in ((http_path, "http"), (https_path, "https")):
-                for item in _read_lines(raw):
-                    s = str(item).strip()
-                    if not s:
+            for item in proxies_all:
+                s = str(item).strip()
+                if not s:
+                    continue
+                # Choose http:// by default; validator handles both schemes
+                if "://" not in s:
+                    s = f"http://{s}"
+                else:
+                    sch = s.split("://", 1)[0]
+                    if sch not in ("http", "https"):
                         continue
-                    if "://" not in s:
-                        s = f"{scheme}://{s}"
-                    else:
-                        sch = s.split("://", 1)[0]
-                        if sch not in ("http", "https"):
-                            continue
-                    candidates.append(s)
-
-            # Deduplicate by endpoint (host:port), prefer http:// when both exist.
+                candidates.append(s)
+            # Deduplicate by endpoint, prefer http:// when both exist
             by_endpoint: dict[str, str] = {}
             order: list[str] = []
             from urllib.parse import urlparse
