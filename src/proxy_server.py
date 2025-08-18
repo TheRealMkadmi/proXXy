@@ -200,6 +200,7 @@ class TunnelProxyServer:
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
+        sticky_upstream: Optional[UpstreamProxy] = None
         try:
             # Parse request line
             line = await asyncio.wait_for(reader.readline(), timeout=self.io_timeout)
@@ -248,10 +249,27 @@ class TunnelProxyServer:
                 await self._respond(writer, 505, "HTTP Version Not Supported")
                 return
 
+            # Choose a sticky upstream for this client connection on first request
+            if sticky_upstream is None:
+                sticky_upstream = self.pool.next()
+                if sticky_upstream is None:
+                    await self._respond(writer, 503, "No Upstreams Available")
+                    return
+                try:
+                    logger.debug(
+                        "tunnel: sticky upstream selected %s://%s:%d for peer=%s",
+                        sticky_upstream.scheme,
+                        sticky_upstream.host,
+                        sticky_upstream.port,
+                        peer,
+                    )
+                except Exception:
+                    pass
+
             if method == "CONNECT":
-                await self._handle_connect(target, hdr_map, reader, writer)
+                await self._handle_connect(target, hdr_map, reader, writer, sticky_upstream)
             else:
-                await self._handle_http(method, target, version, headers, hdr_map, reader, writer)
+                await self._handle_http(method, target, version, headers, hdr_map, reader, writer, sticky_upstream)
         except asyncio.TimeoutError:
             await self._respond(writer, 408, "Request Timeout")
         except Exception as e:
@@ -277,6 +295,7 @@ class TunnelProxyServer:
         _hdrs: Dict[str, str],
         client_r: asyncio.StreamReader,
         client_w: asyncio.StreamWriter,
+        sticky: Optional[UpstreamProxy] = None,
     ) -> None:
         # Parse host:port
         host, port = self._split_host_port(target)
@@ -286,7 +305,8 @@ class TunnelProxyServer:
 
         attempts = self.max_retries + 1
         last_err: Optional[str] = None
-        for up in self.pool.next_many(attempts) or []:
+        candidates: List[UpstreamProxy] = ([sticky] if sticky is not None else self.pool.next_many(attempts)) or []
+        for up in candidates:
             try:
                 up_r, up_w = await self._open_upstream(up)
             except Exception as e:
@@ -361,6 +381,7 @@ class TunnelProxyServer:
         hdr_map: Dict[str, str],
         client_r: asyncio.StreamReader,
         client_w: asyncio.StreamWriter,
+        sticky: Optional[UpstreamProxy] = None,
     ) -> None:
         # Ensure absolute-form URI for upstream HTTP proxy
         if target.startswith("http://") or target.startswith("https://"):
@@ -375,7 +396,8 @@ class TunnelProxyServer:
 
         attempts = self.max_retries + 1
         last_err: Optional[str] = None
-        for up in self.pool.next_many(attempts) or []:
+        candidates: List[UpstreamProxy] = ([sticky] if sticky is not None else self.pool.next_many(attempts)) or []
+        for up in candidates:
             try:
                 up_r, up_w = await self._open_upstream(up)
             except Exception as e:

@@ -33,6 +33,7 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     # Only set values when flags are provided (no default), so env/defaults remain if omitted.
     ap.add_argument("--output-dir", dest="output_dir", help="Override PROXXY_OUTPUT_DIR")
+    # Minimal validation flags
     ap.add_argument("--url", dest="validation_url", help="Override PROXXY_VALIDATION_URL")
     ap.add_argument("--workers", dest="validator_workers", type=int, help="Override PROXXY_VALIDATOR_WORKERS")
     ap.add_argument("--timeout", dest="validator_timeout", type=float, help="Override PROXXY_VALIDATOR_TIMEOUT (seconds)")
@@ -46,10 +47,7 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--pool-debounce-ms", dest="pool_debounce_ms", type=int, help="Override PROXXY_POOL_DEBOUNCE_MS (default 150)")
     ap.add_argument("--pool-ttl-seconds", dest="pool_ttl_seconds", type=int, help="Override PROXXY_POOL_TTL_SECONDS (default 900)")
     ap.add_argument("--pool-prune-interval-seconds", dest="pool_prune_interval_seconds", type=int, help="Override PROXXY_POOL_PRUNE_INTERVAL_SECONDS (default 30)")
-    # Pool recheck aggressiveness
-    ap.add_argument("--pool-recheck-per-interval", dest="pool_recheck_per_interval", type=int, help="Override PROXXY_POOL_RECHECK_PER_INTERVAL (default 200)")
-    ap.add_argument("--pool-recheck-workers", dest="pool_recheck_workers", type=int, help="Override PROXXY_POOL_RECHECK_WORKERS (default 32)")
-    ap.add_argument("--pool-recheck-timeout", dest="pool_recheck_timeout", type=float, help="Override PROXXY_POOL_RECHECK_TIMEOUT (seconds, default 2.5)")
+    # Pool recheck flags removed to simplify
     
     ap.add_argument("--min-upstreams", "--min-proxies", dest="min_upstreams", type=int, help="Override PROXXY_MIN_UPSTREAMS (minimum upstream proxies required before starting server)")
     
@@ -67,6 +65,12 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["0", "1"],
     help="Set PROXXY_PROXY_SIMULATE (1 to simulate; no server)",
     )
+    ap.add_argument(
+        "--simple",
+        dest="simple",
+        action="store_true",
+        help="Simple mode: skip validator and publish scraped proxies directly (sets PROXXY_SIMPLE=1)",
+    )
     return ap.parse_args(argv)
 
 
@@ -75,9 +79,9 @@ def main() -> int:
     args = _parse_cli_args()
     cli_to_env = {
         "output_dir": "PROXXY_OUTPUT_DIR",
-        "validation_url": "PROXXY_VALIDATION_URL",
-        "validator_workers": "PROXXY_VALIDATOR_WORKERS",
-        "validator_timeout": "PROXXY_VALIDATOR_TIMEOUT",
+    "validation_url": "PROXXY_VALIDATION_URL",
+    "validator_workers": "PROXXY_VALIDATOR_WORKERS",
+    "validator_timeout": "PROXXY_VALIDATOR_TIMEOUT",
         "proxy_host": "PROXXY_PROXY_HOST",
         "proxy_port": "PROXXY_PROXY_PORT",
         "proxy_log_level": "PROXXY_PROXY_LOG_LEVEL",
@@ -87,10 +91,7 @@ def main() -> int:
         "pool_debounce_ms": "PROXXY_POOL_DEBOUNCE_MS",
         "pool_ttl_seconds": "PROXXY_POOL_TTL_SECONDS",
         "pool_prune_interval_seconds": "PROXXY_POOL_PRUNE_INTERVAL_SECONDS",
-        "pool_health_url": "PROXXY_POOL_HEALTH_URL",
-        "pool_recheck_per_interval": "PROXXY_POOL_RECHECK_PER_INTERVAL",
-        "pool_recheck_workers": "PROXXY_POOL_RECHECK_WORKERS",
-        "pool_recheck_timeout": "PROXXY_POOL_RECHECK_TIMEOUT",
+    # Pool recheck flags removed
     "min_upstreams": "PROXXY_MIN_UPSTREAMS",
         # Pass-through for dependent components
         "scraper_log_level": "PROXXY_SCRAPER_LOG_LEVEL",
@@ -101,9 +102,11 @@ def main() -> int:
         if hasattr(args, attr) and getattr(args, attr) is not None:
             os.environ[env_key] = str(getattr(args, attr))
 
-    # Unify URLs: if pool-health not provided, use validation URL
-    if not os.environ.get("PROXXY_POOL_HEALTH_URL") and os.environ.get("PROXXY_VALIDATION_URL"):
-        os.environ["PROXXY_POOL_HEALTH_URL"] = os.environ["PROXXY_VALIDATION_URL"]
+    # Simple mode flag
+    if getattr(args, "simple", False):
+        os.environ["PROXXY_SIMPLE"] = "1"
+
+    # Health checks use the validation URL; no separate flag
     cfg = load_config_from_env()
     os.makedirs(cfg.output_dir, exist_ok=True)
 
@@ -121,8 +124,7 @@ def main() -> int:
 
     # Log config summary for at-a-glance visibility
     logger.info(
-        "config: output_dir='%s' validate_url='%s' workers=%d timeout=%.1fs proxy=%s:%d "
-        "pool_file='%s' ttl=%ss prune_interval=%ss status_interval=%ss",
+        "config: output_dir='%s' validate_url='%s' workers=%d timeout=%.1fs proxy=%s:%d pool_file='%s' ttl=%ss prune_interval=%ss status_interval=%ss",
         cfg.output_dir,
         cfg.validation_url,
         cfg.validator_workers,
@@ -161,10 +163,10 @@ def main() -> int:
                 debounce_ms=cfg.pool_debounce_ms,
                 ttl_seconds=getattr(cfg, "pool_ttl_seconds", 900),
                 prune_interval_seconds=getattr(cfg, "pool_prune_interval_seconds", 30),
-                health_check_url=getattr(cfg, "pool_health_url", cfg.validation_url),
-                recheck_timeout=float(os.getenv("PROXXY_POOL_RECHECK_TIMEOUT", "2.5")),
-                recheck_per_interval=int(os.getenv("PROXXY_POOL_RECHECK_PER_INTERVAL", "200")),
-                recheck_workers=int(os.getenv("PROXXY_POOL_RECHECK_WORKERS", "32")),
+                health_check_url=cfg.validation_url,
+                recheck_timeout=2.5,
+                recheck_per_interval=200,
+                recheck_workers=16,
                 enable_recheck=True,
             )
         )

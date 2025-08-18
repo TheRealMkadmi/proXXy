@@ -10,33 +10,30 @@ from typing import List, Optional
 
 # Orchestrator operates as a library; config import is package-relative
 from .config import OrchestratorConfig, load_config_from_env
-from .bloom import TimeWindowBloom
 from .proxy_server import run_tunnel_proxy
+from .validator import check_proxies_stream
 
 logger = logging.getLogger("proXXy.orchestrator")
 
 
 def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, status_queue=None, pool_queue=None) -> None:
     """
-    Child process continuous loop: scrape -> validate -> publish (to pool), then immediately repeat.
-    Runs entirely via native Python imports (no CLI), in a single persistent process.
-    Emits end-of-cycle metrics to a status_queue for live health reporting.
+    Throughput-first producer loop:
+    - Scrape HTTP/HTTPS sources
+    - Read, normalize, dedupe by endpoint
+    - Validate candidates (streaming)
+    - Publish live proxies to pool
+    - Emit basic cycle metrics
     """
     cfg = config or load_config_from_env()
 
-    # Ensure imports for sibling modules (scraper/validator/utils) when spawned on Windows (spawn)
+    # Ensure sibling imports when spawned on Windows (spawn)
     try:
         base = os.path.abspath(os.path.dirname(__file__))
         if base not in sys.path:
             sys.path.insert(0, base)
     except Exception:
         pass
-
-    try:
-        import validator as validator_mod  # type: ignore
-    except Exception as e:
-        logger.exception("produce: failed importing validator: %s", e)
-        return
 
     def emit(evt):
         if status_queue is None:
@@ -48,17 +45,8 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
 
     os.makedirs(cfg.output_dir, exist_ok=True)
 
-    # publishing via pool_queue (IPC), no HTTP pool
-
     cycle = 0
-    # Dead-proxy Bloom: skip proxies that failed within the recent window
-    dead_bf_enabled = (os.getenv("PROXXY_DEAD_BF_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off"))
-    dead_bf_window = float(os.getenv("PROXXY_DEAD_BF_WINDOW_SECONDS", "3600"))
-    dead_bf_slices = int(os.getenv("PROXXY_DEAD_BF_SLICES", "4"))
-    dead_bf_capacity = int(os.getenv("PROXXY_DEAD_BF_CAPACITY_PER_SLICE", "100000"))
-    dead_bf_fpr = float(os.getenv("PROXXY_DEAD_BF_FPR", "0.01"))
-    dead_bf_retest_pct = float(os.getenv("PROXXY_DEAD_BF_RETEST_PCT", "0.02"))
-    dead_bf = TimeWindowBloom(window_seconds=dead_bf_window, slices=dead_bf_slices, capacity_per_slice=dead_bf_capacity, error_rate=dead_bf_fpr) if dead_bf_enabled else None
+
     while not stop.is_set():
         cycle += 1
         scrape_total = 0
@@ -66,12 +54,11 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
         live_count = 0
         published = False
         publish_size = 0
-        combined_size = 0  # legacy metric kept for logs
+        combined_size = 0
         scrape_dt = 0.0
         validate_dt = 0.0
 
-        res = None
-        # 1) Scrape via subprocess to avoid Twisted reactor reuse; writes HTTP/HTTPS files
+        # 1) Scrape via subprocess; writes HTTP/HTTPS files
         try:
             logger.info("scrape: starting (subprocess)")
             t0 = time.perf_counter()
@@ -89,7 +76,6 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
             if cp.returncode != 0:
                 logger.error("scrape: subprocess failed rc=%s stderr=%s", cp.returncode, (cp.stderr or "").strip())
             else:
-                # best-effort parse of JSON summary
                 try:
                     import json as _json
                     data = _json.loads((cp.stdout or "").strip() or "{}")
@@ -100,7 +86,7 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
         except Exception as e:
             logger.exception("scrape: failed: %s", e)
 
-        # 2) Collect proxies from output files (HTTP/HTTPS), prefix scheme, dedupe
+        # 2) Collect proxies from output files (HTTP/HTTPS), prefix scheme
         candidates: List[str] = []
         try:
             def _read_lines(path: str) -> List[str]:
@@ -129,166 +115,99 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
                         if sch not in ("http", "https"):
                             continue
                     candidates.append(s)
-            candidates = list(dict.fromkeys(candidates))
+
+            # Deduplicate by endpoint (host:port), prefer http:// when both exist.
+            by_endpoint: dict[str, str] = {}
+            order: list[str] = []
+            from urllib.parse import urlparse
+            for p in candidates:
+                try:
+                    u = urlparse(p)
+                    endpoint = u.netloc
+                    if not endpoint:
+                        continue
+                    prev = by_endpoint.get(endpoint)
+                    if prev is None:
+                        by_endpoint[endpoint] = p
+                        order.append(endpoint)
+                    else:
+                        if p.startswith("http://") and not prev.startswith("http://"):
+                            by_endpoint[endpoint] = p
+                except Exception:
+                    continue
+            candidates = [by_endpoint[e] for e in order]
             scrape_total = max(scrape_total, len(candidates))
         except Exception:
             candidates = []
 
-        # Optional pre-filter using dead Bloom
-        if dead_bf is not None and candidates:
-            import random as _rnd
-            _rnd.seed(os.getpid() + int(time.time()))
-            filtered: List[str] = []
-            skipped = 0
-            explored = 0
-            for p in candidates:
-                hit = dead_bf.contains(p)
-                if not hit:
-                    filtered.append(p)
-                    continue
-                # exploration: re-test a small fraction of known-dead to discover resurrections
-                if _rnd.random() < max(0.0, min(1.0, dead_bf_retest_pct)):
-                    filtered.append(p)
-                    explored += 1
-                else:
-                    skipped += 1
-            candidates = filtered
+        # Validate candidates and publish only live ones
+        candidates_count = len(candidates)
+        if candidates_count > 0:
             try:
-                emit({"type": "deadbf_prefilter", "skipped": int(skipped), "explored": int(explored)})
+                emit({
+                    "type": "validate_start",
+                    "total": candidates_count,
+                    "workers": int(getattr(cfg, "validator_workers", 0) or 0),
+                    "ts": time.time(),
+                })
             except Exception:
                 pass
 
-        candidates_count = len(candidates)
-        if candidates_count == 0:
-            logger.warning("produce: no scraped proxies found; keeping previous pool content")
-        else:
-            workers = max(1, min(cfg.validator_workers, candidates_count))
-            logger.info(
-                "validate: start total=%d workers=%d url='%s' timeout=%.1f",
-                candidates_count,
-                workers,
-                cfg.validation_url,
-                cfg.validator_timeout,
-            )
-            if logger.isEnabledFor(logging.DEBUG):
-                sample = ", ".join(candidates[:3])
-                logger.debug("produce: sample candidates: %s%s", sample, " ..." if len(candidates) > 3 else "")
-            # Emit validate_start for in-progress visibility
-            emit({
-                "type": "validate_start",
-                "cycle": cycle,
-                "total": candidates_count,
-                "workers": workers,
-                "ts": time.time(),
-            })
-
-            # Streaming validation: push to pool in near real-time (tiny batching) via IPC queue
+            t_val0 = time.perf_counter()
+            live_count = 0
             batch: List[str] = []
-            last_flush = time.perf_counter()
 
             def _flush_batch():
-                nonlocal batch, last_flush, publish_size
+                nonlocal batch, publish_size, published
                 if not batch:
                     return
-                count = len(batch)
-                try:
-                    # send a single message to reduce overhead
-                    if pool_queue is not None:
-                        try:
-                            pool_queue.put({"type": "add", "proxies": list(batch)}, timeout=0.1)
-                        except Exception:
-                            # best-effort fallback: split if oversized
-                            try:
-                                for i in range(0, len(batch), 2000):
-                                    pool_queue.put({"type": "add", "proxies": batch[i:i+2000]}, timeout=0.1)
-                            except Exception:
-                                pass
-                    # estimate bytes similar to previous HTTP body size
-                    body_bytes = len(("\n".join(batch) + "\n").encode("utf-8"))
-                    publish_size += body_bytes
+                if pool_queue is not None:
                     try:
-                        emit({"type": "publish_flush", "count": int(count), "bytes": int(body_bytes), "ts": time.time()})
+                        pool_queue.put({"type": "add", "proxies": list(batch)}, timeout=0.1)
                     except Exception:
-                        pass
-                finally:
-                    batch.clear()
-                    last_flush = time.perf_counter()
+                        try:
+                            for i in range(0, len(batch), 2000):
+                                pool_queue.put({"type": "add", "proxies": batch[i:i+2000]}, timeout=0.1)
+                        except Exception:
+                            pass
+                body_bytes = len(("\n".join(batch) + "\n").encode("utf-8"))
+                publish_size += body_bytes
+                published = True
+                batch.clear()
 
-            t1 = time.perf_counter()
-            # In-progress counters for status ticker
-            progress_completed = 0
-            last_prog_emit = t1
-
-            def on_live(proxy: str, details):
-                nonlocal live_count, last_flush
+            def _on_live(pxy: str, details: dict) -> None:
+                nonlocal live_count
                 live_count += 1
-                batch.append(proxy)
-                now = time.perf_counter()
-                # flush on small batch or short timer
-                if len(batch) >= 50 or (now - last_flush) >= 0.2:
+                batch.append(pxy)
+                if len(batch) >= 200:
                     _flush_batch()
 
-            def on_result(details):
-                nonlocal progress_completed, last_prog_emit
-                progress_completed += 1
-                try:
-                    if dead_bf is not None and not details.get("ok", False):
-                        p = details.get("proxy")
-                        if isinstance(p, str) and p:
-                            dead_bf.add(p)
-                except Exception:
-                    pass
-                now2 = time.perf_counter()
-                if (now2 - last_prog_emit) >= 1.0:
-                    try:
-                        emit({
-                            "type": "validate_progress",
-                            "cycle": cycle,
-                            "completed": progress_completed,
-                            "live": live_count,
-                            "total": candidates_count,
-                            "workers": workers,
-                            "ts": time.time(),
-                        })
-                    except Exception:
-                        pass
-                    last_prog_emit = now2
+            def _on_result(_details: dict) -> None:
+                # Optional: could emit validate_progress here if desired
+                return
 
             try:
-                _live_sorted, _details = validator_mod.check_proxies_stream(
-                    candidates,
-                    cfg.validation_url,
-                    workers,
-                    float(cfg.validator_timeout),
-                    on_live=on_live,
-                    on_result=on_result,
+                check_proxies_stream(
+                    proxies=candidates,
+                    url=str(getattr(cfg, "validation_url", "https://www.netflix.com/")),
+                    workers=int(getattr(cfg, "validator_workers", 256)),
+                    timeout=float(getattr(cfg, "validator_timeout", 5.0)),
+                    on_live=_on_live,
+                    on_result=_on_result,
                     verify_ssl=True,
                     user_agent=None,
                     total=candidates_count,
                     stop_event=stop,
                 )
-                # final flush
-                _flush_batch()
-                # final progress emit
-                try:
-                    emit({
-                        "type": "validate_progress",
-                        "cycle": cycle,
-                        "completed": progress_completed,
-                        "live": live_count,
-                        "total": candidates_count,
-                        "workers": workers,
-                        "ts": time.time(),
-                    })
-                except Exception:
-                    pass
-                validate_dt = time.perf_counter() - t1
-                published = live_count > 0
-                logger.info("produce: streamed to pool live=%d (validator %.2fs)", live_count, validate_dt)
             except Exception as e:
-                logger.exception("produce: validator step failed: %s", e)
+                logger.exception("validate: failed: %s", e)
+            finally:
+                _flush_batch()
+                validate_dt = time.perf_counter() - t_val0
+                logger.info("validate: live=%d in %.2fs", live_count, validate_dt)
+        else:
+            logger.warning("produce: no scraped proxies found; skipping validation")
 
-        # Emit end-of-cycle metrics
         emit({
             "type": "cycle_end",
             "cycle": cycle,
@@ -300,7 +219,7 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
             "scrape_dt": scrape_dt,
             "validate_dt": validate_dt,
             "combined_input_size": max(0, combined_size),
-            "workers": min(cfg.validator_workers, max(1, candidates_count)),
+            "workers": 0,
             "ts": time.time(),
         })
 

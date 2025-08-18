@@ -1,7 +1,3 @@
-"""
-Programmatic proxy scraper module built on Scrapy.
-Refactored to be imported and used from other Python code (no CLI/printing).
-"""
 from __future__ import annotations
 
 import os
@@ -157,6 +153,23 @@ def run_proxy_scrape(
         "RETRY_ENABLED": retry_times > 0,
         "RETRY_TIMES": retry_times,
         "RETRY_HTTP_CODES": retry_http_codes or [500, 502, 503, 504, 408],
+        # Efficiency tweaks (fixed constants)
+        "CONCURRENT_REQUESTS": 64,
+        "CONCURRENT_REQUESTS_PER_DOMAIN": 32,
+        "REACTOR_THREADPOOL_MAXSIZE": 32,
+        "DOWNLOAD_MAXSIZE": 1_000_000,  # 1MB cap per response body
+        "DOWNLOAD_WARNSIZE": 256_000,
+        "COMPRESSION_ENABLED": True,
+        "DNS_TIMEOUT": min(5, max(1, int(request_timeout))),
+        "DNSCACHE_ENABLED": True,
+        # Disable cookies and Telnet console to reduce overhead
+        "COOKIES_ENABLED": False,
+        "TELNETCONSOLE_ENABLED": False,
+        # No artificial delay
+        "RANDOMIZE_DOWNLOAD_DELAY": False,
+        "DOWNLOAD_DELAY": 0,
+        # Avoid caching to ensure fresh lists; sources are tiny
+        "HTTPCACHE_ENABLED": False,
     }
     if user_agent:
         settings["USER_AGENT"] = user_agent

@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 from typing import Iterable, List, Optional, Set, Tuple, Dict, Any, Callable
 
 import requests
+import random
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 from loguru import logger
@@ -19,7 +20,10 @@ try:
     logger.remove()
 except Exception:
     pass
-logger.add(sys.stderr, level=_LOG_LEVEL, backtrace=False, diagnose=False, enqueue=True)
+# Allow switching off queueing for lower overhead
+_LOG_ENQUEUE = os.getenv("PROXXY_VALIDATOR_LOG_ENQUEUE", os.getenv("PROXXY_LOG_ENQUEUE", "0")).strip()
+_ENQUEUE_BOOL = _LOG_ENQUEUE.lower() not in ("0", "false", "no", "off")
+logger.add(sys.stderr, level=_LOG_LEVEL, backtrace=False, diagnose=False, enqueue=_ENQUEUE_BOOL)
 
 # Thread-local session for connection pooling without cross-thread sharing
 _thread_local = threading.local()
@@ -52,6 +56,27 @@ _MIN_BPS = int(os.getenv("PROXXY_VALIDATOR_MIN_BPS", "16384"))
 _REQUIRE_HTTP11 = os.getenv("PROXXY_VALIDATOR_REQUIRE_HTTP11", "1")
 # OS trust TLS preflight via system CA store (replicates Schannel/curl behavior)
 _OS_TRUST_PREFLIGHT = os.getenv("PROXXY_VALIDATOR_OS_TRUST_PREFLIGHT", "1")
+
+# Global pool size (tuned per workers unless explicitly set via env)
+_POOL_SIZE = int(os.getenv("PROXXY_VALIDATOR_POOL_SIZE", "256"))
+
+# Cache tokens from env once
+WANT_TOKENS = [
+    t.strip().lower()
+    for t in (os.getenv("PROXXY_VALIDATOR_BODY_CONTAINS", "") or "").split(",")
+    if t.strip()
+]
+
+# TLS preflight success cache (avoid repeating CONNECT+TLS when not needed)
+_TLS_PREFLIGHT_CACHE: Dict[Tuple[str, int, str, int], float] = {}
+_TLS_PREFLIGHT_TTL_SECONDS = float(os.getenv("PROXXY_VALIDATOR_TLS_PREFLIGHT_TTL", "600"))
+
+# Failure log sampling
+_FAIL_LOG_EVERY = max(1, int(os.getenv("PROXXY_VALIDATOR_FAIL_LOG_EVERY", "1")))
+_fail_log_counter = 0
+
+# Double-check sampling
+_DOUBLE_CHECK_RATIO = float(os.getenv("PROXXY_VALIDATOR_DOUBLE_CHECK_RATIO", "0.25"))
 
 def _os_trust_tls_preflight(proxy: str, url: str) -> Tuple[bool, str]:
     """
@@ -111,6 +136,20 @@ def _os_trust_tls_preflight(proxy: str, url: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"tls_preflight:{str(e)[:256]}"
 
+def _tls_preflight_cache_key(proxy: str, url: str) -> Optional[Tuple[str, int, str, int]]:
+    try:
+        u = urlparse(url)
+        target_host = u.hostname or ""
+        target_port = u.port or (443 if (u.scheme or "").lower() == "https" else 80)
+        pu = urlparse(proxy)
+        proxy_host = pu.hostname or ""
+        proxy_port = pu.port or (443 if (pu.scheme or "").lower() == "https" else 80)
+        if not target_host or not proxy_host or not proxy_port:
+            return None
+        return (proxy_host, int(proxy_port), target_host, int(target_port))
+    except Exception:
+        return None
+
 def _get_session(timeout: float, verify_ssl: bool, user_agent: Optional[str] = None) -> requests.Session:
     sess: Optional[requests.Session] = getattr(_thread_local, "session", None)
     if sess is not None:
@@ -118,18 +157,20 @@ def _get_session(timeout: float, verify_ssl: bool, user_agent: Optional[str] = N
 
     sess = requests.Session()
     adapter = HTTPAdapter(
-        pool_connections=256,
-        pool_maxsize=256,
+        pool_connections=_POOL_SIZE,
+        pool_maxsize=_POOL_SIZE,
         max_retries=Retry(total=0, connect=0, read=0, redirect=0, backoff_factor=0),
     )
     sess.mount("http://", adapter)
     sess.mount("https://", adapter)
     # Honor verify flag to enforce TLS verification
     sess.verify = verify_ssl
+    # Disable env proxy pickup; we pass proxies explicitly
+    sess.trust_env = False
     sess.headers.update(
         {
             "Accept": "*/*",
-            "Accept-Encoding": "identity",
+            # Let requests negotiate gzip/deflate/br to save bandwidth
             "Connection": "keep-alive",
             "Accept-Language": os.getenv("PROXXY_VALIDATOR_ACCEPT_LANGUAGE", "en-US,en;q=0.9"),
         }
@@ -173,10 +214,27 @@ def _check_one_requests(
         return proxy, False, None, f"tcp_preflight:{e}", None, None
 
     # OS trust TLS preflight (detect untrusted cert chains akin to curl/Schannel)
-    if (_OS_TRUST_PREFLIGHT or "1") and str(_OS_TRUST_PREFLIGHT).strip().lower() not in ("0", "false", "no", "off"):
-        ok_tls, tls_err = _os_trust_tls_preflight(proxies.get("http") or proxy, url)
-        if not ok_tls:
-            return proxy, False, None, f"os_trust:{tls_err}", None, None
+    if (
+        (_OS_TRUST_PREFLIGHT or "1")
+        and str(_OS_TRUST_PREFLIGHT).strip().lower() not in ("0", "false", "no", "off")
+        and verify_ssl
+        and (urlparse(url).scheme or "https").lower() == "https"
+    ):
+        cache_key = _tls_preflight_cache_key(proxies.get("http") or proxy, url)
+        now_ts = time.time()
+        if cache_key is not None:
+            ts = _TLS_PREFLIGHT_CACHE.get(cache_key)
+            if ts is not None and (now_ts - ts) <= _TLS_PREFLIGHT_TTL_SECONDS:
+                pass  # cached success; skip preflight
+            else:
+                ok_tls, tls_err = _os_trust_tls_preflight(proxies.get("http") or proxy, url)
+                if not ok_tls:
+                    return proxy, False, None, f"os_trust:{tls_err}", None, None
+                _TLS_PREFLIGHT_CACHE[cache_key] = now_ts
+        else:
+            ok_tls, tls_err = _os_trust_tls_preflight(proxies.get("http") or proxy, url)
+            if not ok_tls:
+                return proxy, False, None, f"os_trust:{tls_err}", None, None
 
     try:
         t0 = time.monotonic()
@@ -187,6 +245,27 @@ def _check_one_requests(
             stream=True,
             allow_redirects=True,
         )
+        # Content-Length early exit
+        try:
+            cl = resp.headers.get("Content-Length")
+            if cl is not None and str(cl).isdigit() and int(cl) < max(1, _MIN_BYTES):
+                try:
+                    elapsed_tmp = float(resp.elapsed.total_seconds()) if resp.elapsed is not None else None
+                except Exception:
+                    elapsed_tmp = None
+                final_url_tmp = resp.url
+                status_tmp = resp.status_code
+                resp.close()
+                return (
+                    proxy,
+                    False,
+                    status_tmp,
+                    f"content_length<{_MIN_BYTES}",
+                    elapsed_tmp,
+                    final_url_tmp,
+                )
+        except Exception:
+            pass
         total = 0
         start_read = time.monotonic()
         first_byte_at: Optional[float] = None
@@ -222,8 +301,7 @@ def _check_one_requests(
 
         # Status and header sanity
         status_ok = 200 <= resp.status_code < 400
-        headers = {k.lower(): v for k, v in (resp.headers or {}).items()}
-        if 300 <= resp.status_code < 400 and "location" not in headers:
+        if 300 <= resp.status_code < 400 and "Location" not in resp.headers:
             status_ok = False
 
         # HTTP version check (when available)
@@ -251,7 +329,7 @@ def _check_one_requests(
         # Optional content signature checks
         tokens_ok = True
         try:
-            want = [t.strip().lower() for t in (os.getenv("PROXXY_VALIDATOR_BODY_CONTAINS", "") or "").split(",") if t.strip()]
+            want = WANT_TOKENS[:] if WANT_TOKENS else []
             if not want:
                 uhost = (url or "").lower()
                 if "netflix.com" in uhost:
@@ -275,11 +353,23 @@ def _check_one_requests(
 
         # Optional double-check to reduce false positives that die immediately after first success
         if ok and (os.getenv("PROXXY_VALIDATOR_DOUBLE_CHECK", "1").strip().lower() not in ("0", "false", "no", "off")):
+            # Decide whether to double-check: sample or borderline results
+            borderline = (total < max(min_bytes * 2, min_bytes + 2048))
+            try:
+                if seen_first and first_byte_at is not None:
+                    dur_tmp = max(1e-6, (time.monotonic() - first_byte_at))
+                    bps_tmp = total / dur_tmp
+                    if bps_tmp < (_MIN_BPS * 1.25):
+                        borderline = True
+            except Exception:
+                pass
+            if not borderline and random.random() >= max(0.0, min(1.0, _DOUBLE_CHECK_RATIO)):
+                return proxy, ok, status, None if ok else f"http={status} bytes={total}", elapsed, final_url
             target2 = _SECOND_URL or url
             try:
                 # fresh session to ensure a new TCP connection path (avoid pooled reuse)
                 sess2 = requests.Session()
-                adapter2 = HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=Retry(total=0, connect=0, read=0, redirect=0, backoff_factor=0))
+                adapter2 = HTTPAdapter(pool_connections=min(16, _POOL_SIZE), pool_maxsize=min(16, _POOL_SIZE), max_retries=Retry(total=0, connect=0, read=0, redirect=0, backoff_factor=0))
                 sess2.mount("http://", adapter2)
                 sess2.mount("https://", adapter2)
                 sess2.verify = sess.verify
@@ -323,8 +413,7 @@ def _check_one_requests(
 
                 # Status and header sanity for second pass
                 status2_ok = 200 <= resp2.status_code < 400
-                h2 = {k.lower(): v for k, v in (resp2.headers or {}).items()}
-                if 300 <= resp2.status_code < 400 and "location" not in h2:
+                if 300 <= resp2.status_code < 400 and "Location" not in resp2.headers:
                     status2_ok = False
 
                 # HTTP version check (when available)
@@ -350,7 +439,7 @@ def _check_one_requests(
                 # Optional content signature checks (second pass)
                 tokens2_ok = True
                 try:
-                    want2 = [t.strip().lower() for t in (os.getenv("PROXXY_VALIDATOR_BODY_CONTAINS", "") or "").split(",") if t.strip()]
+                    want2 = WANT_TOKENS[:] if WANT_TOKENS else []
                     if not want2:
                         uhost2 = (target2 or "").lower()
                         if "netflix.com" in uhost2:
@@ -412,6 +501,10 @@ def check_proxies(
         return None
 
     max_workers = max(1, int(workers))
+    # Tie pool size to workers unless overridden by env
+    global _POOL_SIZE
+    if os.getenv("PROXXY_VALIDATOR_POOL_SIZE") is None:
+        _POOL_SIZE = max(32, max_workers * 2)
     with futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="proxychk") as ex:
         inflight: Set[futures.Future] = set()
         prox_iter = iter(proxies)
@@ -441,7 +534,9 @@ def check_proxies(
                     )
                     successes += 1
                 else:
-                    logger.debug("failed: proxy={} err={}", proxy, err)
+                    # sample failure logs to reduce overhead
+                    if _FAIL_LOG_EVERY <= 1 or (completed % _FAIL_LOG_EVERY) == 0:
+                        logger.debug("failed: proxy={} err={}", proxy, err)
                 nxt = _next_unique(prox_iter)
                 if nxt is not None:
                     inflight.add(ex.submit(_check_one, nxt, url, timeout, verify_ssl, user_agent))
@@ -526,6 +621,10 @@ def check_proxies_stream(
         should_stop = lambda: False
 
     max_workers = max(1, int(workers))
+    # Tie pool size to workers unless overridden by env
+    global _POOL_SIZE
+    if os.getenv("PROXXY_VALIDATOR_POOL_SIZE") is None:
+        _POOL_SIZE = max(32, max_workers * 2)
     with futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="proxychk") as ex:
         inflight: Set[futures.Future] = set()
         prox_iter = iter(proxies)

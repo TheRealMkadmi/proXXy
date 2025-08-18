@@ -55,16 +55,17 @@ def load_config_from_env() -> OrchestratorConfig:
     # Pool maintenance + recheck
     pool_ttl_seconds = int(os.environ.get("PROXXY_POOL_TTL_SECONDS", "900"))  # 15 minutes
     pool_prune_interval_seconds = int(os.environ.get("PROXXY_POOL_PRUNE_INTERVAL_SECONDS", "30"))
-    pool_health_url = os.environ.get("PROXXY_POOL_HEALTH_URL", validation_url)
+    # Health check URL mirrors validation URL; no separate flag
+    pool_health_url = validation_url
     
     # Minimum upstream proxies required before starting server
     min_upstreams = int(os.environ.get("PROXXY_MIN_UPSTREAMS", "10"))
 
     return OrchestratorConfig(
         output_dir=output_dir,
-        validation_url=validation_url,
-        validator_workers=validator_workers,
-        validator_timeout=validator_timeout,
+    validation_url=validation_url,
+    validator_workers=validator_workers,
+    validator_timeout=validator_timeout,
         proxy_host=proxy_host,
         proxy_port=proxy_port,
         proxy_log_level=proxy_log_level,
@@ -74,6 +75,6 @@ def load_config_from_env() -> OrchestratorConfig:
         pool_debounce_ms=pool_debounce_ms,
         pool_ttl_seconds=pool_ttl_seconds,
         pool_prune_interval_seconds=pool_prune_interval_seconds,
-        pool_health_url=pool_health_url,
+    pool_health_url=pool_health_url,
     min_upstreams=min_upstreams,
     )
