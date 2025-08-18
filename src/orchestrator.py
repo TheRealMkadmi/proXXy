@@ -57,6 +57,7 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
         combined_size = 0
         scrape_dt = 0.0
         validate_dt = 0.0
+        published_count = 0
 
         # 1) Scrape using pluggable scrapers (in-memory aggregation)
         proxies_all: List[str] = []
@@ -150,10 +151,12 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
                 pass
 
             t_val0 = time.perf_counter()
-            live_count = 0
+            published_count = 0
+            validated_count = 0
             completed_count = 0
             last_progress_emit = time.monotonic()
             batch: List[str] = []
+            published_seen: set[str] = set()
             # Flush to pool early so proxy can start once min_upstreams are available
             flush_threshold = max(1, int(getattr(cfg, "min_upstreams", 10)))
             last_flush_ts = time.monotonic()
@@ -184,8 +187,12 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
                 last_flush_ts = time.monotonic()
 
             def _on_live(pxy: str, details: dict) -> None:
-                nonlocal live_count, last_flush_ts
-                live_count += 1
+                nonlocal published_count, last_flush_ts, published_seen
+                # publish unique only
+                if pxy in published_seen:
+                    return
+                published_seen.add(pxy)
+                published_count += 1
                 batch.append(pxy)
                 if len(batch) >= flush_threshold:
                     _flush_batch()
@@ -205,7 +212,7 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
                         emit({
                             "type": "validate_progress",
                             "completed": completed_count,
-                            "live": live_count,
+                            "live": published_count,
                             "total": candidates_count,
                             "workers": int(getattr(cfg, "validator_workers", 0) or 0),
                             "ts": time.time(),
@@ -215,7 +222,7 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
                 return
 
             try:
-                check_proxies_stream(
+                live_list, _ = check_proxies_stream(
                     proxies=candidates,
                     url=str(getattr(cfg, "validation_url", "https://www.netflix.com/")),
                     workers=int(getattr(cfg, "validator_workers", 256)),
@@ -227,12 +234,16 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
                     total=candidates_count,
                     stop_event=stop,
                 )
+                try:
+                    validated_count = len(live_list or [])
+                except Exception:
+                    validated_count = 0
             except Exception as e:
                 logger.exception("validate: failed: %s", e)
             finally:
                 _flush_batch()
                 validate_dt = time.perf_counter() - t_val0
-                logger.info("validate: live=%d in %.2fs", live_count, validate_dt)
+                logger.info("validate: validated=%d published=%d in %.2fs", validated_count, published_count, validate_dt)
         else:
             logger.warning("produce: no scraped proxies found; skipping validation")
 
@@ -241,7 +252,7 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
             "cycle": cycle,
             "scrape_total": scrape_total,
             "candidates": candidates_count,
-            "validate_live": live_count,
+            "validate_live": published_count,
             "published": published,
             "publish_size": publish_size,
             "scrape_dt": scrape_dt,
@@ -275,7 +286,6 @@ def tunnel_proxy_server_loop(stop: threading.Event, config: Optional[Orchestrato
     port = cfg.proxy_port
     pool_file = cfg.pool_file_path
     min_upstreams = max(0, int(getattr(cfg, "min_upstreams", 1)))
-    simulate = os.environ.get("PROXXY_PROXY_SIMULATE", "0").lower() not in ("0", "false", "no")
 
     def _count_upstreams() -> int:
         try:
@@ -289,66 +299,6 @@ def tunnel_proxy_server_loop(stop: threading.Event, config: Optional[Orchestrato
         except Exception:
             return 0
 
-    if simulate:
-        # Simulated mode: announce and monitor file; do not start server
-        if min_upstreams > 0:
-            while not stop.is_set():
-                have = _count_upstreams()
-                if have >= min_upstreams:
-                    border = "=" * 72
-                    try:
-                        logger.info(border)
-                        logger.info("= PROXY READY: upstreams >= %d (have %d) =", min_upstreams, have)
-                        logger.info("= Simulated start on %s:%d =", host, port)
-                        logger.info(border)
-                    except Exception:
-                        pass
-                    break
-                try:
-                    emit({"type": "proxy_waiting", "have": int(have), "need": int(min_upstreams)})
-                except Exception:
-                    pass
-                stop.wait(1.0)
-            if stop.is_set():
-                return
-        emit({"type": "proxy_starting"})
-        try:
-            emit({"type": "proxy_started", "pid": int(os.getpid())})
-        except Exception:
-            emit({"type": "proxy_started"})
-        # Announce readiness once file has required entries
-        def _ready_watch_sim():
-            while not stop.is_set():
-                try:
-                    count = _count_upstreams()
-                    if count >= min_upstreams:
-                        logger.info("proxy: ready (simulated %s:%d; upstreams>=%d)", host, port, min_upstreams)
-                        try:
-                            emit({"type": "proxy_ready", "upstreams": int(count)})
-                        except Exception:
-                            pass
-                        return
-                except Exception:
-                    pass
-                stop.wait(0.5)
-        threading.Thread(target=_ready_watch_sim, name="proxy-ready-sim", daemon=True).start()
-
-        # Stream simple counters to console
-        def _sim_stream():
-            last = -1
-            while not stop.is_set():
-                cnt = _count_upstreams()
-                if cnt != last:
-                    logger.info("sim-tunnel: upstreams=%d file=%s", cnt, pool_file)
-                    last = cnt
-                stop.wait(1.0)
-        threading.Thread(target=_sim_stream, name="proxy-sim-stream", daemon=True).start()
-
-        # Hold until stop
-        while not stop.is_set():
-            stop.wait(0.5)
-        logger.info("proxy: stopped (simulated tunnel)")
-        return
 
     # Non-simulated: wait for enough upstreams before starting server
     if min_upstreams > 0:

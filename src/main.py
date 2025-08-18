@@ -53,24 +53,6 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     
     # Optional convenience flags
     ap.add_argument("--scraper-log-level", dest="scraper_log_level", help="Set PROXXY_SCRAPER_LOG_LEVEL for Scrapy logs")
-    ap.add_argument(
-        "--proxy-capture-output",
-        dest="proxy_capture_output",
-        choices=["0", "1"],
-    help="Set PROXXY_PROXY_CAPTURE_OUTPUT (reserved; no effect for tunnel)",
-    )
-    ap.add_argument(
-        "--proxy-simulate",
-        dest="proxy_simulate",
-        choices=["0", "1"],
-    help="Set PROXXY_PROXY_SIMULATE (1 to simulate; no server)",
-    )
-    ap.add_argument(
-        "--simple",
-        dest="simple",
-        action="store_true",
-        help="Simple mode: skip validator and publish scraped proxies directly (sets PROXXY_SIMPLE=1)",
-    )
     return ap.parse_args(argv)
 
 
@@ -95,16 +77,17 @@ def main() -> int:
     "min_upstreams": "PROXXY_MIN_UPSTREAMS",
         # Pass-through for dependent components
         "scraper_log_level": "PROXXY_SCRAPER_LOG_LEVEL",
-        "proxy_capture_output": "PROXXY_PROXY_CAPTURE_OUTPUT",
-        "proxy_simulate": "PROXXY_PROXY_SIMULATE",
     }
     for attr, env_key in cli_to_env.items():
         if hasattr(args, attr) and getattr(args, attr) is not None:
             os.environ[env_key] = str(getattr(args, attr))
 
-    # Simple mode flag
-    if getattr(args, "simple", False):
-        os.environ["PROXXY_SIMPLE"] = "1"
+    # Defaults to improve tunnel resilience unless explicitly overridden by env/CLI:
+    # - Try more upstream proxies before giving up a client request
+    # - Quicker dial timeout to fail fast and move to next upstream
+    os.environ.setdefault("PROXXY_PROXY_UPSTREAM_RETRIES", "6")   # default was 2
+    os.environ.setdefault("PROXXY_PROXY_DIAL_TIMEOUT", "1.5")     # seconds (default 3.0)
+
 
     # Health checks use the validation URL; no separate flag
     cfg = load_config_from_env()
@@ -164,9 +147,10 @@ def main() -> int:
                 ttl_seconds=getattr(cfg, "pool_ttl_seconds", 900),
                 prune_interval_seconds=getattr(cfg, "pool_prune_interval_seconds", 30),
                 health_check_url=cfg.validation_url,
-                recheck_timeout=2.5,
-                recheck_per_interval=200,
-                recheck_workers=16,
+                # More aggressive pool hygiene: faster recheck and higher throughput
+                recheck_timeout=1.0,          # was 2.5
+                recheck_per_interval=1000,    # was 200
+                recheck_workers=64,           # was 16
                 enable_recheck=True,
             )
         )
