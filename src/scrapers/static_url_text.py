@@ -1,36 +1,46 @@
 from __future__ import annotations
 
-from typing import Dict, List, Any, Sequence, Mapping
+from typing import Dict, List, Any, Sequence
 
 import utils
-from .extractors.text import TextExtractor
-from .sources import normalize_sources
+from .base import extract_proxies
 
 class StaticUrlTextScraper:
     name = "static_url_text"
 
     def __init__(self, protocols: Sequence[str] = ("HTTP", "HTTPS")) -> None:
         self.protocols = tuple(p.upper() for p in protocols)
-        self._extractor = TextExtractor()
+    # Text extraction is now handled via extract_proxies helper
 
     def scrape(self) -> List[str]:
+        """Fetch proxies from text-only sources defined in proxy_sources.json.
+
+        Note: proxy_sources.json contains only plain text URLs. Any HTML-based
+        sources are implemented as dedicated scrapers (children of DynamicHtmlScraper)
+        and do not go through this class.
+        """
         raw = utils.proxy_sources() or {}
-        # Filter to specified protocols only
         subset: Dict[str, List[Any]] = {k.upper(): v for k, v in raw.items() if k.upper() in self.protocols}
-        # Normalize and fetch content via requests (synchronous, small files); reuse Scrapy settings later if needed
+
+        # Fetch content via requests (synchronous, small files)
         from requests import get
         out: List[str] = []
         seen = set()
-        norm = normalize_sources(subset)
-        for proto, specs in norm.items():
-            for spec in specs:
+        for proto, items in subset.items():
+            for it in items:
+                url: str = ""
+                if isinstance(it, str):
+                    url = it.strip()
+                elif isinstance(it, dict):
+                    url = str(it.get("url", "")).strip()
+                if not url:
+                    continue
                 try:
-                    resp = get(spec.url, timeout=5)
+                    resp = get(url, timeout=5)
                     if resp.status_code < 200 or resp.status_code >= 400:
                         continue
                     content = resp.text or ""
-                    res = self._extractor.extract(content)
-                    for p in res.proxies:
+                    for p in extract_proxies(content):
                         if p not in seen:
                             seen.add(p)
                             out.append(p)

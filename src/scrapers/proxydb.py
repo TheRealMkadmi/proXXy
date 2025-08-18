@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import List, Sequence, Optional
-from .extractors.base import PROXY_PATTERN
+from .base import PROXY_PATTERN
 
 from .dynamic_html import DynamicHtmlScraper
 
