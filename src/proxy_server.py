@@ -176,12 +176,15 @@ class TunnelProxyServer:
         self.max_retries = max(0, int(os.getenv("PROXXY_PROXY_UPSTREAM_RETRIES", str(max_retries))))
         self._server: Optional[asyncio.AbstractServer] = None
         # Failure backoff cache for upstream selection (skip recently failed endpoints)
-        self.failure_ttl = float(os.getenv("PROXXY_PROXY_UPSTREAM_FAILURE_TTL", "30"))
+        # Default disabled (0) to avoid any cross-request stickiness
+        self.failure_ttl = float(os.getenv("PROXXY_PROXY_UPSTREAM_FAILURE_TTL", "0"))
         # Key: (scheme, host, port, username, password)
         self._failures: Dict[Tuple[str, str, int, str, str], float] = {}
         # Candidate scan controls per client request
         self.scan_max = int(os.getenv("PROXXY_PROXY_UPSTREAM_SCAN_MAX", "50"))
         self.scan_budget = float(os.getenv("PROXXY_PROXY_UPSTREAM_SCAN_BUDGET", "8.0"))
+        # Dedicated idle timeout for CONNECT tunnels; 0 = no idle timeout (recommended for H2)
+        self.tunnel_idle_timeout = float(os.getenv("PROXXY_PROXY_TUNNEL_IDLE_TIMEOUT", "0"))
 
     async def start(self) -> None:
         self._server = await asyncio.start_server(self._handle_client, self.host, self.port, start_serving=True)
@@ -207,7 +210,7 @@ class TunnelProxyServer:
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
-        sticky_upstream: Optional[UpstreamProxy] = None
+        # no sticky upstream; select upstream per request
         try:
             # Parse request line
             line = await asyncio.wait_for(reader.readline(), timeout=self.io_timeout)
@@ -256,27 +259,15 @@ class TunnelProxyServer:
                 await self._respond(writer, 505, "HTTP Version Not Supported")
                 return
 
-            # Choose a sticky upstream for this client connection on first request
-            if sticky_upstream is None:
-                sticky_upstream = self.pool.next()
-                if sticky_upstream is None:
-                    await self._respond(writer, 503, "No Upstreams Available")
-                    return
-                try:
-                    logger.debug(
-                        "tunnel: sticky upstream selected %s://%s:%d for peer=%s",
-                        sticky_upstream.scheme,
-                        sticky_upstream.host,
-                        sticky_upstream.port,
-                        peer,
-                    )
-                except Exception:
-                    pass
+            # No sticky upstream; choose per-request in handler
+            if self.pool.size() <= 0:
+                await self._respond(writer, 503, "No Upstreams Available")
+                return
 
             if method == "CONNECT":
-                await self._handle_connect(target, hdr_map, reader, writer, sticky_upstream)
+                await self._handle_connect(target, hdr_map, reader, writer, None)
             else:
-                await self._handle_http(method, target, version, headers, hdr_map, reader, writer, sticky_upstream)
+                await self._handle_http(method, target, version, headers, hdr_map, reader, writer, None)
         except asyncio.TimeoutError:
             await self._respond(writer, 408, "Request Timeout")
         except Exception as e:
@@ -314,8 +305,6 @@ class TunnelProxyServer:
         last_err: Optional[str] = None
         # Build candidate list: prefer sticky, then extras to honor retries
         _cand: List[UpstreamProxy] = []
-        if sticky is not None:
-            _cand.append(sticky)
         _extras = self.pool.next_many(max(attempts, min(self.pool.size(), int(getattr(self, "scan_max", 20)))))
         # Deduplicate by endpoint + credentials
         _seen_keys = set()
@@ -328,17 +317,18 @@ class TunnelProxyServer:
                 continue
             _seen_keys.add(_key)
             candidates.append(up)
-        # Skip recently failed upstreams within TTL window
-        now_ts = time.monotonic()
-        filtered: List[UpstreamProxy] = []
-        for up in candidates:
-            _key = (up.scheme, up.host, up.port, up.username or "", up.password or "")
-            ts = self._failures.get(_key, 0.0)
-            if ts and (now_ts - ts) < self.failure_ttl:
-                continue
-            filtered.append(up)
-        if filtered:
-            candidates = filtered
+        # Skip recently failed upstreams within TTL window (only if TTL > 0)
+        if self.failure_ttl > 0:
+            now_ts = time.monotonic()
+            filtered: List[UpstreamProxy] = []
+            for up in candidates:
+                _key = (up.scheme, up.host, up.port, up.username or "", up.password or "")
+                ts = self._failures.get(_key, 0.0)
+                if ts and (now_ts - ts) < self.failure_ttl:
+                    continue
+                filtered.append(up)
+            if filtered:
+                candidates = filtered
         budget_deadline = time.monotonic() + max(0.0, float(getattr(self, "scan_budget", 8.0)))
         for up in candidates:
             if time.monotonic() > budget_deadline:
@@ -354,8 +344,6 @@ class TunnelProxyServer:
                 lines = [
                     f"CONNECT {host}:{port} HTTP/1.1",
                     f"Host: {host}:{port}",
-                    "Proxy-Connection: keep-alive",
-                    "Connection: keep-alive",
                 ]
                 auth = up.auth_header_value()
                 if auth:
@@ -385,7 +373,7 @@ class TunnelProxyServer:
                     # Inform client and start piping
                     self._clear_fail(up)
                     await self._respond_raw(client_w, b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                    await self._pipe_bidirectional(client_r, client_w, up_r, up_w)
+                    await self._pipe_bidirectional(client_r, client_w, up_r, up_w, bufsize=65536, idle_timeout=self.tunnel_idle_timeout)
                     return
                 else:
                     last_err = f"upstream-status-{code}"
@@ -439,8 +427,6 @@ class TunnelProxyServer:
         last_err: Optional[str] = None
         # Build candidate list: prefer sticky, then extras to honor retries
         _cand: List[UpstreamProxy] = []
-        if sticky is not None:
-            _cand.append(sticky)
         _extras = self.pool.next_many(max(attempts, min(self.pool.size(), int(getattr(self, "scan_max", 20)))))
         # Deduplicate by endpoint + credentials
         _seen_keys = set()
@@ -453,18 +439,19 @@ class TunnelProxyServer:
                 continue
             _seen_keys.add(_key)
             candidates.append(up)
-        # Skip recently failed upstreams within TTL window
-        now_ts = time.monotonic()
-        filtered: List[UpstreamProxy] = []
+        # Skip recently failed upstreams within TTL window (only if TTL > 0)
         budget_deadline = time.monotonic() + max(0.0, float(getattr(self, "scan_budget", 8.0)))
-        for up in candidates:
-            _key = (up.scheme, up.host, up.port, up.username or "", up.password or "")
-            ts = self._failures.get(_key, 0.0)
-            if ts and (now_ts - ts) < self.failure_ttl:
-                continue
-            filtered.append(up)
-        if filtered:
-            candidates = filtered
+        if self.failure_ttl > 0:
+            now_ts = time.monotonic()
+            filtered: List[UpstreamProxy] = []
+            for up in candidates:
+                _key = (up.scheme, up.host, up.port, up.username or "", up.password or "")
+                ts = self._failures.get(_key, 0.0)
+                if ts and (now_ts - ts) < self.failure_ttl:
+                    continue
+                filtered.append(up)
+            if filtered:
+                candidates = filtered
         for up in candidates:
             if time.monotonic() > budget_deadline:
                 break
@@ -476,14 +463,16 @@ class TunnelProxyServer:
                 continue
             try:
                 # Build request to upstream
-                out_lines: List[str] = [f"{method} {abs_uri} {version}"]
-                # Rewrite headers minimally: drop client Proxy-* headers, add our Proxy-Authorization if needed
+                # Always speak HTTP/1.1 to upstream HTTP proxy regardless of client version
+                out_lines: List[str] = [f"{method} {abs_uri} HTTP/1.1"]
+                # Rewrite headers: drop client Proxy-* headers and Connection, add our Proxy-Authorization if needed
                 for h in raw_headers:
                     if not h or ":" not in h:
                         continue
                     k, v = h.split(":", 1)
                     kn = k.strip()
-                    if kn.lower().startswith("proxy-"):
+                    kln = kn.lower()
+                    if kln.startswith("proxy-") or kln == "connection":
                         continue
                     out_lines.append(f"{kn}:{v}")
                 auth = up.auth_header_value()
@@ -520,32 +509,38 @@ class TunnelProxyServer:
         b_r: asyncio.StreamReader,
         b_w: asyncio.StreamWriter,
         bufsize: int = 65536,
+        idle_timeout: Optional[float] = None,
     ) -> None:
         async def pump(src: asyncio.StreamReader, dst: asyncio.StreamWriter) -> None:
+            # If idle_timeout <= 0, do not enforce a read timeout (prevents H2 CANCEL due to proxy idle close)
+            tmo_val = self.io_timeout if idle_timeout is None else float(idle_timeout)
+            use_timeout = tmo_val is not None and tmo_val > 0
             try:
                 while True:
-                    chunk = await asyncio.wait_for(src.read(bufsize), timeout=self.io_timeout)
+                    if use_timeout:
+                        chunk = await asyncio.wait_for(src.read(bufsize), timeout=tmo_val)
+                    else:
+                        chunk = await src.read(bufsize)
                     if not chunk:
                         break
                     dst.write(chunk)
-                    await asyncio.wait_for(dst.drain(), timeout=self.io_timeout)
+                    if use_timeout:
+                        await asyncio.wait_for(dst.drain(), timeout=tmo_val)
+                    else:
+                        await dst.drain()
             except asyncio.TimeoutError:
-                # Idle timeout; close the destination to unwind
+                # Idle timeout; simply unwind; no half-close on tunnel
                 pass
             except Exception:
                 pass
             finally:
-                try:
-                    if not dst.is_closing():
-                        dst.write_eof()
-                except Exception:
-                    pass
+                # Do not write_eof() on tunnels; it can break TLS/H2 streams
+                pass
 
         t1 = asyncio.create_task(pump(a_r, b_w))
         t2 = asyncio.create_task(pump(b_r, a_w))
-        done, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
-        for t in pending:
-            t.cancel()
+        # Wait for both directions to finish (EOF or idle timeout) to avoid abrupt half-closes that break H2
+        await asyncio.gather(t1, t2, return_exceptions=True)
         # Close both writers
         for w in (a_w, b_w):
             try:
@@ -566,7 +561,7 @@ class TunnelProxyServer:
     async def _respond_raw(self, w: asyncio.StreamWriter, data: bytes) -> None:
         try:
             w.write(data)
-            await asyncio.wait_for(w.drain(), timeout=1.0)
+            await asyncio.wait_for(w.drain(), timeout=self.io_timeout)
         except Exception:
             pass
 
@@ -619,6 +614,8 @@ class TunnelProxyServer:
         return 0
 
     def _mark_fail(self, up: UpstreamProxy) -> None:
+        if self.failure_ttl <= 0:
+            return
         try:
             key = (up.scheme, up.host, up.port, up.username or "", up.password or "")
             self._failures[key] = time.monotonic()
@@ -626,6 +623,8 @@ class TunnelProxyServer:
             pass
 
     def _clear_fail(self, up: UpstreamProxy) -> None:
+        if self.failure_ttl <= 0:
+            return
         try:
             key = (up.scheme, up.host, up.port, up.username or "", up.password or "")
             self._failures.pop(key, None)
