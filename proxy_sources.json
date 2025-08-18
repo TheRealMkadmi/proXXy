@@ -43,12 +43,12 @@
     "https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/refs/heads/main/http.txt",
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/refs/heads/main/proxies/protocols/http/data.txt"
   ],
-    "HTTPS": [
+  "HTTPS": [
     "https://openproxylist.xyz/https.txt",
     "https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=https",
     "https://raw.githubusercontent.com/vmheaven/VMHeaven-Free-Proxy-Updated/refs/heads/main/https.txt",
     "https://proxyspace.pro/https.txt",
-    "https://vakhov.github.io/fresh-proxy-list/https.txt", 
+    "https://vakhov.github.io/fresh-proxy-list/https.txt",
     "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-https.txt",
     "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/https.txt",
     "https://api.proxyscrape.com/?request=getproxies&proxytype=https&timeout=10000&country=all&ssl=all&anonymity=all",

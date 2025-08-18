@@ -63,17 +63,34 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
         try:
             logger.info("scrape: starting (in-process, pluggable)")
             t0 = time.perf_counter()
+            # Scraper runtime config from env (allows toggling SSL verification)
+            verify_ssl_env = os.environ.get("PROXXY_SCRAPER_VERIFY_SSL", "1").lower() not in ("0", "false", "no")
+            ua_env = os.environ.get("PROXXY_SCRAPER_UA", None)
+            try:
+                logger.info("scrape.config: verify_ssl=%s ua=%s", verify_ssl_env, bool(ua_env))
+            except Exception:
+                pass
             scrapers = [
-                StaticUrlTextScraper(protocols=("HTTP", "HTTPS")),
-                ProxyDBScraper(protocol="http", anon_levels=(2, 4), country="", pages=1),
+                StaticUrlTextScraper(protocols=("HTTP", "HTTPS"), verify_ssl=verify_ssl_env),
+                ProxyDBScraper(protocol="http", anon_levels=(2, 4), country="", pages=1, user_agent=ua_env, verify_ssl=verify_ssl_env),
             ]
             seen = set()
             for s in scrapers:
-                items = s.scrape()
-                for p in items:
-                    if p not in seen:
-                        seen.add(p)
-                        proxies_all.append(p)
+                try:
+                    sname = getattr(s, "name", s.__class__.__name__)
+                    logger.info("scrape.%s: starting", sname)
+                    t_s0 = time.perf_counter()
+                    items = s.scrape()
+                    dt_s = time.perf_counter() - t_s0
+                    added = 0
+                    for p in items:
+                        if p not in seen:
+                            seen.add(p)
+                            proxies_all.append(p)
+                            added += 1
+                    logger.info("scrape.%s: got=%d added=%d dupes=%d in %.2fs", sname, len(items), added, len(items) - added, dt_s)
+                except Exception:
+                    logger.exception("scrape.%s: failed", getattr(s, "name", s.__class__.__name__))
             scrape_dt = time.perf_counter() - t0
             scrape_total = len(proxies_all)
             logger.info("scrape: done in %.2fs total=%d", scrape_dt, scrape_total)

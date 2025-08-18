@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 from typing import List, Sequence, Optional
 from .base import PROXY_PATTERN
 
 from .dynamic_html import DynamicHtmlScraper
+
+logger = logging.getLogger("proXXy.scrapers.proxydb")
 
 
 class ProxyDBScraper:
@@ -104,34 +107,49 @@ class ProxyDBScraper:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import math
         import re
+        import time
         import requests
-
+ 
         headers = {"User-Agent": self.user_agent} if self.user_agent else None
-
+        sess = requests.Session()
+        sess.trust_env = False
+ 
+        logger.info("proxydb: starting (protocol=%s, pages=%d, verify_ssl=%s, ua=%s)",
+                    self.protocol, self.pages, self.verify_ssl, bool(self.user_agent))
+ 
         # ProxyDB paginates in steps of 30
         step = 30
-
+ 
         def fetch(offset: int) -> str:
             url = self._build_url(offset=offset)
+            t0 = time.perf_counter()
             try:
-                resp = requests.get(url, headers=headers, timeout=self.timeout, verify=self.verify_ssl)
+                logger.debug("proxydb.fetch: %s", url)
+                resp = sess.get(url, headers=headers, timeout=self.timeout, verify=self.verify_ssl)
+                dt = time.perf_counter() - t0
                 if 200 <= resp.status_code < 400:
-                    return resp.text or ""
-            except Exception:
-                pass
+                    txt = resp.text or ""
+                    logger.info("proxydb.fetch: %s -> %d (%d bytes) in %.2fs", url, resp.status_code, len(txt.encode('utf-8')), dt)
+                    return txt
+                logger.warning("proxydb.fetch: %s -> HTTP %d in %.2fs", url, resp.status_code, dt)
+            except Exception as e:
+                dt = time.perf_counter() - t0
+                logger.warning("proxydb.fetch: %s -> error %s: %s in %.2fs", url, e.__class__.__name__, str(e)[:200], dt)
             return ""
-
+ 
         # First: fetch page 1 (offset 0)
         first_html = fetch(0)
         results: List[str] = []
         seen: set[str] = set()
-
+ 
         # Extract from first page
-        for item in self._extract_from_html(first_html):
+        first_items = self._extract_from_html(first_html)
+        for item in first_items:
             if item not in seen:
                 seen.add(item)
                 results.append(item)
-
+        logger.info("proxydb.parse: offset=0 -> %d items", len(first_items))
+ 
         # Try to parse total proxies, e.g.: "Showing 1 to 30 of 2,345 total proxies"
         total_count: Optional[int] = None
         if first_html:
@@ -141,13 +159,14 @@ class ProxyDBScraper:
                     total_count = int(m.group(1).replace(",", ""))
                 except Exception:
                     total_count = None
-
+ 
         # Determine how many pages to fetch. If total_count parsed, ignore self.pages to return full dataset.
         if total_count is not None and total_count > 0:
             total_pages = max(1, math.ceil(total_count / step))
         else:
             total_pages = max(1, int(self.pages))
-
+        logger.info("proxydb: total_pages=%d (step=%d)", total_pages, step)
+ 
         # Prepare remaining offsets (we already fetched offset 0)
         remaining_offsets = [i * step for i in range(1, total_pages)]
         if remaining_offsets:
@@ -158,9 +177,14 @@ class ProxyDBScraper:
                     html = fut.result() or ""
                     if not html:
                         continue
-                    for item in self._extract_from_html(html):
+                    items = self._extract_from_html(html)
+                    added = 0
+                    for item in items:
                         if item not in seen:
                             seen.add(item)
                             results.append(item)
-
+                            added += 1
+                    logger.info("proxydb.parse: offset=%d -> got=%d added=%d dupes=%d", future_map[fut], len(items), added, len(items)-added)
+ 
+        logger.info("proxydb: done total=%d unique", len(results))
         return results

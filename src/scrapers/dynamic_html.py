@@ -11,5 +11,7 @@ class DynamicHtmlScraper(Protocol):
                 - Config-driven sources come exclusively from `proxy_sources.json` and are TEXT endpoints.
                 - Any HTML or JS-driven sources must be implemented as classes that implement this protocol
                     and are invoked directly (they do NOT pass through the config layer).
+                - Scrapers MUST NOT use upstream proxies; scraping makes direct outbound requests only.
+                  Validation and proxy usage happen later in the pipeline.
                 """
                 ...
