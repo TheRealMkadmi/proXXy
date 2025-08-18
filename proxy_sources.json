@@ -37,10 +37,26 @@
     "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/http/http.txt",
     "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/http.txt",
     "https://openproxylist.xyz/http.txt",
+    "https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=http",
     "https://www.proxy-list.download/api/v1/get?type=http",
     "https://raw.githubusercontent.com/elliottophellia/yakumo/master/results/http/global/http_checked.txt",
     "https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/refs/heads/main/http.txt",
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/refs/heads/main/proxies/protocols/http/data.txt"
+  ],
+    "HTTPS": [
+    "https://openproxylist.xyz/https.txt",
+    "https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=https",
+    "https://raw.githubusercontent.com/vmheaven/VMHeaven-Free-Proxy-Updated/refs/heads/main/https.txt",
+    "https://proxyspace.pro/https.txt",
+    "https://vakhov.github.io/fresh-proxy-list/https.txt", 
+    "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-https.txt",
+    "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/https.txt",
+    "https://api.proxyscrape.com/?request=getproxies&proxytype=https&timeout=10000&country=all&ssl=all&anonymity=all",
+    "https://github.com/zloi-user/hideip.me/raw/refs/heads/master/https.txt",
+    "https://raw.githubusercontent.com/Anonym0usWork1221/Free-Proxies/main/proxy_files/https_proxies.txt",
+    "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/https/https.txt",
+    "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/refs/heads/main/proxies/protocols/https/data.txt"
   ],
   "SOCKS4": [
     "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks4",
@@ -99,19 +115,5 @@
     "https://raw.githubusercontent.com/elliottophellia/yakumo/master/results/socks5/global/socks5_checked.txt",
     "https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/refs/heads/main/socks5.txt",
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/refs/heads/main/proxies/protocols/socks5/data.txt"
-  ],
-  "HTTPS": [
-    "https://openproxylist.xyz/https.txt",
-    "https://raw.githubusercontent.com/vmheaven/VMHeaven-Free-Proxy-Updated/refs/heads/main/https.txt",
-    "https://proxyspace.pro/https.txt",
-    "https://vakhov.github.io/fresh-proxy-list/https.txt", 
-    "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-https.txt",
-    "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/https.txt",
-    "https://api.proxyscrape.com/?request=getproxies&proxytype=https&timeout=10000&country=all&ssl=all&anonymity=all",
-    "https://github.com/zloi-user/hideip.me/raw/refs/heads/master/https.txt",
-    "https://raw.githubusercontent.com/Anonym0usWork1221/Free-Proxies/main/proxy_files/https_proxies.txt",
-    "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/https/https.txt",
-    "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt",
-    "https://raw.githubusercontent.com/proxifly/free-proxy-list/refs/heads/main/proxies/protocols/https/data.txt"
   ]
 }

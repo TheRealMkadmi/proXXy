@@ -10,6 +10,7 @@ from typing import List, Optional
 
 # Orchestrator operates as a library; config import is package-relative
 from .config import OrchestratorConfig, load_config_from_env
+from .bloom import TimeWindowBloom
 from .proxy_server import run_tunnel_proxy
 
 logger = logging.getLogger("proXXy.orchestrator")
@@ -50,6 +51,14 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
     # publishing via pool_queue (IPC), no HTTP pool
 
     cycle = 0
+    # Dead-proxy Bloom: skip proxies that failed within the recent window
+    dead_bf_enabled = (os.getenv("PROXXY_DEAD_BF_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off"))
+    dead_bf_window = float(os.getenv("PROXXY_DEAD_BF_WINDOW_SECONDS", "3600"))
+    dead_bf_slices = int(os.getenv("PROXXY_DEAD_BF_SLICES", "4"))
+    dead_bf_capacity = int(os.getenv("PROXXY_DEAD_BF_CAPACITY_PER_SLICE", "100000"))
+    dead_bf_fpr = float(os.getenv("PROXXY_DEAD_BF_FPR", "0.01"))
+    dead_bf_retest_pct = float(os.getenv("PROXXY_DEAD_BF_RETEST_PCT", "0.02"))
+    dead_bf = TimeWindowBloom(window_seconds=dead_bf_window, slices=dead_bf_slices, capacity_per_slice=dead_bf_capacity, error_rate=dead_bf_fpr) if dead_bf_enabled else None
     while not stop.is_set():
         cycle += 1
         scrape_total = 0
@@ -125,6 +134,30 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
         except Exception:
             candidates = []
 
+        # Optional pre-filter using dead Bloom
+        if dead_bf is not None and candidates:
+            import random as _rnd
+            _rnd.seed(os.getpid() + int(time.time()))
+            filtered: List[str] = []
+            skipped = 0
+            explored = 0
+            for p in candidates:
+                hit = dead_bf.contains(p)
+                if not hit:
+                    filtered.append(p)
+                    continue
+                # exploration: re-test a small fraction of known-dead to discover resurrections
+                if _rnd.random() < max(0.0, min(1.0, dead_bf_retest_pct)):
+                    filtered.append(p)
+                    explored += 1
+                else:
+                    skipped += 1
+            candidates = filtered
+            try:
+                emit({"type": "deadbf_prefilter", "skipped": int(skipped), "explored": int(explored)})
+            except Exception:
+                pass
+
         candidates_count = len(candidates)
         if candidates_count == 0:
             logger.warning("produce: no scraped proxies found; keeping previous pool content")
@@ -198,6 +231,13 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
             def on_result(details):
                 nonlocal progress_completed, last_prog_emit
                 progress_completed += 1
+                try:
+                    if dead_bf is not None and not details.get("ok", False):
+                        p = details.get("proxy")
+                        if isinstance(p, str) and p:
+                            dead_bf.add(p)
+                except Exception:
+                    pass
                 now2 = time.perf_counter()
                 if (now2 - last_prog_emit) >= 1.0:
                     try:

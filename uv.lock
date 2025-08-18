@@ -305,6 +305,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "colorama" },
     { name = "loguru" },
+    { name = "rbloom" },
     { name = "requests" },
     { name = "scrapy" },
     { name = "tqdm" },
@@ -316,6 +317,7 @@ dependencies = [
 requires-dist = [
     { name = "colorama", specifier = ">=0.4.6,<1.0.0" },
     { name = "loguru", specifier = ">=0.7.2" },
+    { name = "rbloom", specifier = ">=1.5.2,<2.0.0" },
     { name = "requests", specifier = ">=2.31.0,<3.0.0" },
     { name = "scrapy", specifier = ">=2.12.0,<3.0.0" },
     { name = "tqdm", specifier = ">=4.67.1,<5.0.0" },
@@ -387,6 +389,24 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/4c/78/9ace6888cf6d390c9aec3ba93020838b08934959b544a7f10b15db815d29/queuelib-1.8.0.tar.gz", hash = "sha256:582bc65514481100b0539bd671da6b355b878869cfc77d92c63b75fcc9cf8e27", size = 11675, upload-time = "2025-03-31T12:18:46.193Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/70/44/542f4e702fafc477260d3463ae1bcdd113faac9d42336601af50985af914/queuelib-1.8.0-py3-none-any.whl", hash = "sha256:599468c5589716e63d3bb753dae7bf32cc94838ade1e7b450a061faec4a2015d", size = 13615, upload-time = "2025-03-31T12:18:43.526Z" },
+]
+
+[[package]]
+name = "rbloom"
+version = "1.5.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d8/bb/ecdaf82414e7ae2d7b7db2568cd06ded008f8bd0fbaa788ddc5f2eeb4be0/rbloom-1.5.2.tar.gz", hash = "sha256:e83544300ca741abdf7214f8f880c05afca4b536a9d77be824c1c68625685803", size = 21178, upload-time = "2024-10-01T11:51:07.922Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/89/77/3f672a00d24e56915df5308a7d0ff9d637a732b844d280410df4d5bb1d61/rbloom-1.5.2-cp37-abi3-macosx_10_12_x86_64.whl", hash = "sha256:d2b6879c2bade72565d5f96b4e1f64fc04ddd679574a2994a1bd70377fe674ac", size = 272119, upload-time = "2024-10-01T11:51:06.532Z" },
+    { url = "https://files.pythonhosted.org/packages/30/9d/49dbb1e0f516467cec135472fad56cff7fd6410bc4641e8ea6bb0ba4cda5/rbloom-1.5.2-cp37-abi3-macosx_11_0_arm64.whl", hash = "sha256:9ae886d880c7ae9ac71cf6704a95043e1a1c826d96257cedad8b157f777581b8", size = 266389, upload-time = "2024-10-01T11:51:05.372Z" },
+    { url = "https://files.pythonhosted.org/packages/36/9d/cc0ee1cb3ef73cb81f32a741d4aa6a771a8e86b460cc98e66b55120a805e/rbloom-1.5.2-cp37-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:7c6ea4862ff750337f67e0cbb705c6261a1b408d7c0721914a5d92b9c11d43df", size = 310611, upload-time = "2024-10-01T11:50:56.952Z" },
+    { url = "https://files.pythonhosted.org/packages/47/83/f803ef934c356d99daa87c4dd7a84c75ff0636307c8661c34fddb878763e/rbloom-1.5.2-cp37-abi3-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:16cce9f19f27465c8c1c529d4cf7e14556a11f431f63e6b7a23921375ffd18af", size = 315453, upload-time = "2024-10-01T11:50:58.622Z" },
+    { url = "https://files.pythonhosted.org/packages/46/71/ecf52efad2bd571e45e26ebbd9268679bf970c0d283d28fa6e4c52cc4edb/rbloom-1.5.2-cp37-abi3-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:be472c8854d4e13f4862822c3c6bcae5190bfa0b59142aba26195d8a171e0d3f", size = 342722, upload-time = "2024-10-01T11:50:59.786Z" },
+    { url = "https://files.pythonhosted.org/packages/65/c6/34abe304c657a3dc4a302b16b47e731213a07e63e1131551bd8db90be7a5/rbloom-1.5.2-cp37-abi3-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:170c34b7a1b26c1d581a6fd537e5af30c9fc18f2ce9cf51b822c390d26b176c6", size = 377790, upload-time = "2024-10-01T11:51:00.813Z" },
+    { url = "https://files.pythonhosted.org/packages/01/89/2c7c55a419fcf037964d2280b57c87a9bd5f1d262f7c666d16fd07c1a768/rbloom-1.5.2-cp37-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:fe497954ffe769ebfbc6c3df091a878a5eb650e21c955aa606fa516be7c2c6d7", size = 300142, upload-time = "2024-10-01T11:51:03.866Z" },
+    { url = "https://files.pythonhosted.org/packages/a4/06/4d4c6852c4aedcd309be7c73369270719836329cce2568077df991133563/rbloom-1.5.2-cp37-abi3-manylinux_2_5_i686.manylinux1_i686.whl", hash = "sha256:05a05b6b44486795cb2ee209563a4d2127f7ec07195caba0038503cd174bc7d1", size = 318791, upload-time = "2024-10-01T11:51:02.613Z" },
+    { url = "https://files.pythonhosted.org/packages/ac/e3/9e39760cb8e6b1181f3732fbc456f8a844f9c000a6d16c14bcf91ae5d6ee/rbloom-1.5.2-cp37-abi3-win32.whl", hash = "sha256:2c59bced1f3d71ad266dbeb5e2b140ed9128f64c083ceddb2a0c94244cc1c923", size = 167143, upload-time = "2024-10-01T11:51:09.839Z" },
+    { url = "https://files.pythonhosted.org/packages/b8/16/d8637d6a7840af37cf1aae2d1cd64e48840ce7e11e049ad0ee477b139856/rbloom-1.5.2-cp37-abi3-win_amd64.whl", hash = "sha256:7297f2040d4e8882baea29cb0c554b9c008b5db616790620278b9aaaf95cf439", size = 174762, upload-time = "2024-10-01T11:51:08.672Z" },
 ]
 
 [[package]]

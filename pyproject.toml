@@ -13,6 +13,7 @@ dependencies = [
     "urllib3>=2.2.0",
     "loguru>=0.7.2",
     "colorama>=0.4.6,<1.0.0",
+    "rbloom>=1.5.2,<2.0.0",
 ]
 
 [build-system]
