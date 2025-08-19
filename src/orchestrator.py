@@ -322,13 +322,6 @@ def tunnel_proxy_server_loop(stop: threading.Event, config: Optional[Orchestrato
         if stop.is_set():
             return
 
-    # Start server
-    emit({"type": "proxy_starting"})
-    try:
-        emit({"type": "proxy_started", "pid": int(os.getpid())})
-    except Exception:
-        emit({"type": "proxy_started"})
-
     # Announce readiness (since min_upstreams satisfied at this point)
     try:
         cnt = _count_upstreams()
@@ -338,14 +331,42 @@ def tunnel_proxy_server_loop(stop: threading.Event, config: Optional[Orchestrato
     except Exception:
         pass
 
-    try:
-        # Run the asyncio-based tunnel server in this thread until stop is set
-        run_tunnel_proxy(stop, host, port, pool_file, emit=emit)
-    except Exception as e:
-        logger.exception("proxy: tunnel server error: %s", e)
-    finally:
+    # Supervisor loop: restart the tunnel server if it exits unexpectedly
+    attempt = 0
+    backoff = 1.5
+    max_backoff = 30.0
+    while not stop.is_set():
+        attempt += 1
+        code = 1
         try:
-            emit({"type": "proxy_exit", "code": 0})
-        except Exception:
-            pass
-        logger.info("proxy: stopped")
+            # lifecycle: starting/started per attempt
+            try:
+                emit({"type": "proxy_starting", "attempt": int(attempt)})
+            except Exception:
+                pass
+            try:
+                emit({"type": "proxy_started", "pid": int(os.getpid()), "attempt": int(attempt)})
+            except Exception:
+                emit({"type": "proxy_started", "attempt": int(attempt)})
+
+            # Run the asyncio-based tunnel server in this thread until stop is set
+            run_tunnel_proxy(stop, host, port, pool_file, emit=emit)
+            code = 0 if stop.is_set() else 1
+        except Exception as e:
+            logger.exception("proxy: tunnel server error (attempt %d): %s", attempt, e)
+            code = 1
+        finally:
+            try:
+                emit({"type": "proxy_exit", "code": int(code), "attempt": int(attempt)})
+            except Exception:
+                pass
+            logger.info("proxy: stopped (attempt %d, code %d)", attempt, code)
+
+        if stop.is_set():
+            break
+
+        # Backoff and restart
+        delay = min(max_backoff, backoff)
+        logger.warning("proxy: restarting in %.1fs (attempt %d)", delay, attempt + 1)
+        stop.wait(delay)
+        backoff = min(max_backoff, backoff * 2)
