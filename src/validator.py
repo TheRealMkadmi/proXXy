@@ -650,6 +650,7 @@ def check_proxies_stream(
     """
     seen: Set[str] = set()
     results: List[Dict[str, Any]] = []
+    live_list: List[str] = []
     submitted = 0
     peak_inflight = 0
     start = time.time()
@@ -708,6 +709,7 @@ def check_proxies_stream(
                     except Exception:
                         pass
                     successes += 1
+                    live_list.append(proxy)
                     results.append(
                         {
                             "proxy": proxy,
@@ -767,7 +769,7 @@ def check_proxies_stream(
                     last_log = now
 
     results.sort(key=lambda r: (float("inf") if r.get("elapsed") is None else r["elapsed"]))
-    live_out = [r["proxy"] for r in results if "proxy" in r and r.get("elapsed") is not None]
+    live_out = list(live_list)
     elapsed_total = time.time() - start
     logger.success(
         "done(stream): checked~{} live={} elapsed={:.1f}s peak_workers={} rate~={:.1f}/s",
