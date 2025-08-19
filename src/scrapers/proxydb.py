@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import List, Sequence, Optional
+import aiohttp
 from .base import PROXY_PATTERN
 
 from .dynamic_html import DynamicHtmlScraper
@@ -104,95 +106,89 @@ class ProxyDBScraper:
         return out
 
     def scrape(self) -> List[str]:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
         import math
         import re
-        import time
-        import requests
- 
-        headers = {"User-Agent": self.user_agent} if self.user_agent else None
-        sess = requests.Session()
-        sess.trust_env = False
 
-        # Suppress noisy TLS warnings when verify_ssl is disabled (debug convenience)
-        if not self.verify_ssl:
-            try:
-                import urllib3  # type: ignore
-                from urllib3.exceptions import InsecureRequestWarning  # type: ignore
-                urllib3.disable_warnings(InsecureRequestWarning)
-            except Exception:
-                pass
- 
-        logger.debug("proxydb: starting (protocol=%s, pages=%d, verify_ssl=%s, ua=%s)",
-                    self.protocol, self.pages, self.verify_ssl, bool(self.user_agent))
- 
-        # ProxyDB paginates in steps of 30
+        headers = {"User-Agent": self.user_agent} if self.user_agent else None
+
+        logger.debug(
+            "proxydb: starting (protocol=%s, pages=%d, verify_ssl=%s, ua=%s)",
+            self.protocol,
+            self.pages,
+            self.verify_ssl,
+            bool(self.user_agent),
+        )
+
         step = 30
- 
         fetch_attempted = 0
         fetch_ok = 0
         fetch_http_fail = 0
         fetch_err = 0
- 
-        def fetch(offset: int) -> str:
+
+        async def _fetch_html(session: aiohttp.ClientSession, url: str) -> str:
             nonlocal fetch_attempted, fetch_ok, fetch_http_fail, fetch_err
-            url = self._build_url(offset=offset)
             fetch_attempted += 1
             try:
-                resp = sess.get(url, headers=headers, timeout=self.timeout, verify=self.verify_ssl)
-                if 200 <= resp.status_code < 400:
-                    fetch_ok += 1
-                    return resp.text or ""
-                fetch_http_fail += 1
+                async with session.get(url) as resp:
+                    if 200 <= resp.status < 400:
+                        fetch_ok += 1
+                        return await resp.text(errors="ignore")
+                    fetch_http_fail += 1
             except Exception:
                 fetch_err += 1
             return ""
- 
-        # First: fetch page 1 (offset 0)
-        first_html = fetch(0)
-        results: List[str] = []
-        seen: set[str] = set()
- 
-        # Extract from first page
-        first_items = self._extract_from_html(first_html)
-        for item in first_items:
-            if item not in seen:
-                seen.add(item)
-                results.append(item)
- 
-        # Try to parse total proxies, e.g.: "Showing 1 to 30 of 2,345 total proxies"
-        total_count: Optional[int] = None
-        if first_html:
-            m = re.search(r"Showing\s+\d+\s+to\s+\d+\s+of\s+([0-9,]+)\s+total\s+proxies", first_html, flags=re.IGNORECASE)
-            if m:
-                try:
-                    total_count = int(m.group(1).replace(",", ""))
-                except Exception:
-                    total_count = None
- 
-        # Determine how many pages to fetch. If total_count parsed, ignore self.pages to return full dataset.
-        if total_count is not None and total_count > 0:
-            total_pages = max(1, math.ceil(total_count / step))
-        else:
-            total_pages = max(1, int(self.pages))
- 
-        # Prepare remaining offsets (we already fetched offset 0)
-        remaining_offsets = [i * step for i in range(1, total_pages)]
-        if remaining_offsets:
-            max_workers = min(16, max(1, len(remaining_offsets)))
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_map = {executor.submit(fetch, off): off for off in remaining_offsets}
-                for fut in as_completed(future_map):
-                    html = fut.result() or ""
-                    if not html:
-                        continue
-                    for item in self._extract_from_html(html):
-                        if item not in seen:
-                            seen.add(item)
-                            results.append(item)
- 
-        logger.info(
-            "proxydb: done total=%d unique fetches=%d ok=%d http_fail=%d err=%d",
-            len(results), fetch_attempted, fetch_ok, fetch_http_fail, fetch_err
-        )
-        return results
+
+        async def _run() -> List[str]:
+            connector = aiohttp.TCPConnector(ssl=self.verify_ssl)
+            timeout = aiohttp.ClientTimeout(total=self.timeout)
+            async with aiohttp.ClientSession(headers=headers, timeout=timeout, connector=connector, trust_env=False) as session:
+                results: List[str] = []
+                seen: set[str] = set()
+
+                # First page
+                first_html = await _fetch_html(session, self._build_url(offset=0))
+                for item in self._extract_from_html(first_html):
+                    if item not in seen:
+                        seen.add(item)
+                        results.append(item)
+
+                total_count: Optional[int] = None
+                if first_html:
+                    m = re.search(r"Showing\s+\d+\s+to\s+\d+\s+of\s+([0-9,]+)\s+total\s+proxies", first_html, flags=re.IGNORECASE)
+                    if m:
+                        try:
+                            total_count = int(m.group(1).replace(",", ""))
+                        except Exception:
+                            total_count = None
+
+                if total_count is not None and total_count > 0:
+                    total_pages = max(1, math.ceil(total_count / step))
+                else:
+                    total_pages = max(1, int(self.pages))
+
+                remaining_offsets = [i * step for i in range(1, total_pages)]
+                if remaining_offsets:
+                    sem = asyncio.Semaphore(min(16, max(1, len(remaining_offsets))))
+
+                    async def fetch_offset(off: int):
+                        url = self._build_url(offset=off)
+                        async with sem:
+                            html = await _fetch_html(session, url)
+                            if not html:
+                                return
+                            for item in self._extract_from_html(html):
+                                if item not in seen:
+                                    seen.add(item)
+                                    results.append(item)
+
+                    tasks = [asyncio.create_task(fetch_offset(off)) for off in remaining_offsets]
+                    if tasks:
+                        await asyncio.gather(*tasks, return_exceptions=True)
+
+                logger.info(
+                    "proxydb: done total=%d unique fetches=%d ok=%d http_fail=%d err=%d",
+                    len(results), fetch_attempted, fetch_ok, fetch_http_fail, fetch_err,
+                )
+                return results
+
+        return asyncio.run(_run())

@@ -7,9 +7,8 @@ import time
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Dict, Tuple
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util import Retry
+import asyncio
+import aiohttp
 
 logger = logging.getLogger("proXXy.poolmgr")
 if not logger.handlers:
@@ -269,7 +268,6 @@ class PoolManager:
         self._stop_ev = threading.Event()
         self._prune_thread = threading.Thread(target=self._prune_loop, name="pool-prune", daemon=True)
         self._recheck_thread: Optional[threading.Thread] = None
-        self._sess: Optional[requests.Session] = None
         # Recheck strike tracking to avoid removing on single transient failure
         self._recheck_strikes: Dict[str, int] = {}
         self._recheck_strike_threshold = int(os.getenv("PROXXY_POOL_RECHECK_STRIKES", "2"))
@@ -350,64 +348,32 @@ class PoolManager:
                 # Never crash pruning thread
                 pass
 
-    def _get_session(self) -> requests.Session:
-        if self._sess is not None:
-            return self._sess
-        sess = requests.Session()
-        adapter = HTTPAdapter(
-            pool_connections=max(32, self.cfg.recheck_workers * 2),
-            pool_maxsize=max(64, self.cfg.recheck_workers * 4),
-            max_retries=Retry(total=0, connect=0, read=0, redirect=0, backoff_factor=0),
-        )
-        sess.mount("http://", adapter)
-        sess.mount("https://", adapter)
-        sess.headers.update(
-            {
-                "Accept": "*/*",
-                "Accept-Encoding": "identity",
-                "Connection": "keep-alive",
-            }
-        )
-        self._sess = sess
-        return sess
-
-    def _recheck_one(self, pxy: str, sess: requests.Session, health_url: str) -> Tuple[str, bool]:
+    async def _recheck_one_async(self, session: aiohttp.ClientSession, pxy: str, health_url: str) -> Tuple[str, bool]:
+        # Tunables
+        min_bytes = int(os.getenv("PROXXY_POOL_RECHECK_MIN_BYTES", os.getenv("PROXXY_VALIDATOR_MIN_BYTES", "1024")))
+        read_window = float(os.getenv("PROXXY_POOL_RECHECK_READ_SECONDS", os.getenv("PROXXY_VALIDATOR_READ_SECONDS", "2.5")))
+        ttfb = float(os.getenv("PROXXY_POOL_RECHECK_TTFB_SECONDS", os.getenv("PROXXY_VALIDATOR_TTFB_SECONDS", "2.0")))
+        chunk_size = int(os.getenv("PROXXY_POOL_RECHECK_CHUNK_SIZE", os.getenv("PROXXY_VALIDATOR_CHUNK_SIZE", "8192")))
         try:
-            proxies = {"http": pxy, "https": pxy}
-            # Use separate connect/read timeouts for recheck to be tolerant of slow reads but fail fast on connect
-            connect_to = float(os.getenv("PROXXY_POOL_RECHECK_CONNECT_TIMEOUT", "1.8"))
-            read_to = float(os.getenv("PROXXY_POOL_RECHECK_READ_TIMEOUT", "4.0"))
-            resp = sess.get(health_url, proxies=proxies, timeout=(connect_to, read_to), stream=True, allow_redirects=True)
-            # Tunables (fallback to validator defaults; softened to mirror validator)
-            min_bytes = int(os.getenv("PROXXY_POOL_RECHECK_MIN_BYTES", os.getenv("PROXXY_VALIDATOR_MIN_BYTES", "1024")))
-            read_window = float(os.getenv("PROXXY_POOL_RECHECK_READ_SECONDS", os.getenv("PROXXY_VALIDATOR_READ_SECONDS", "2.5")))
-            ttfb = float(os.getenv("PROXXY_POOL_RECHECK_TTFB_SECONDS", os.getenv("PROXXY_VALIDATOR_TTFB_SECONDS", "2.0")))
-            chunk_size = int(os.getenv("PROXXY_POOL_RECHECK_CHUNK_SIZE", os.getenv("PROXXY_VALIDATOR_CHUNK_SIZE", "8192")))
-            total = 0
-            t_start = time.monotonic()
-            seen = False
-            read_error = False
-            try:
-                for chunk in resp.iter_content(chunk_size=max(1, int(chunk_size))):
+            async with session.get(health_url, proxy=pxy, allow_redirects=True) as resp:
+                if not (200 <= resp.status < 400):
+                    return pxy, False
+                total = 0
+                seen = False
+                t_start = time.monotonic()
+                async for chunk in resp.content.iter_chunked(max(1, int(chunk_size))):
                     now = time.monotonic()
-                    # First byte deadline
                     if not seen and (now - t_start) >= ttfb:
-                        read_error = True
-                        break
+                        return pxy, False
                     if not chunk:
                         if (now - t_start) >= read_window:
                             break
                         continue
-                    if not seen:
-                        seen = True
+                    seen = True
                     total += len(chunk)
-                    if total >= min_bytes or (now - t_start) >= read_window:
+                    if total >= max(1, min_bytes) or (now - t_start) >= read_window:
                         break
-            except Exception:
-                read_error = True
-            ok = (200 <= resp.status_code < 400) and (total >= max(1, min_bytes)) and (not read_error)
-            resp.close()
-            return pxy, ok
+                return pxy, (seen and total >= max(1, min_bytes))
         except Exception:
             return pxy, False
 
@@ -427,13 +393,33 @@ class PoolManager:
                     sample = self.pool.oldest(count)
                 if not sample:
                     continue
-                sess = self._get_session()
+
+                async def _run_batch() -> Dict[str, bool]:
+                    timeout_total = float(os.getenv("PROXXY_POOL_RECHECK_TIMEOUT", str(self.cfg.recheck_timeout)))
+                    connect_to = float(os.getenv("PROXXY_POOL_RECHECK_CONNECT_TIMEOUT", "1.8"))
+                    tmo = aiohttp.ClientTimeout(total=max(0.1, timeout_total), connect=min(connect_to, timeout_total))
+                    headers = {
+                        "Accept": "*/*",
+                        "Connection": "keep-alive",
+                    }
+                    sem = asyncio.Semaphore(max(1, int(self.cfg.recheck_workers)))
+                    results: Dict[str, bool] = {}
+
+                    async with aiohttp.ClientSession(timeout=tmo, headers=headers, trust_env=False) as session:
+                        async def one(p: str):
+                            async with sem:
+                                px, ok = await self._recheck_one_async(session, p, health_url)
+                                results[px] = ok
+
+                        tasks = [asyncio.create_task(one(p)) for p in sample]
+                        if tasks:
+                            await asyncio.gather(*tasks, return_exceptions=True)
+                    return results
+
+                outcome = asyncio.run(_run_batch())
                 removed = 0
                 ok_count = 0
-                # Simple thread pool using threading + join for minimal deps
-                # Given the small sample sizes, sequential can also suffice; keep it simple here.
-                for pxy in sample:
-                    _, ok = self._recheck_one(pxy, sess, health_url)
+                for pxy, ok in outcome.items():
                     if ok:
                         ok_count += 1
                         try:

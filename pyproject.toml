@@ -9,11 +9,10 @@ dependencies = [
     "yaspin>=3.1.0,<4.0.0",
     "scrapy>=2.12.0,<3.0.0",
     "tqdm>=4.67.1,<5.0.0",
-    "requests>=2.31.0,<3.0.0",
-    "urllib3>=2.2.0",
     "loguru>=0.7.2",
     "colorama>=0.4.6,<1.0.0",
     "rbloom>=1.5.2,<2.0.0",
+    "aiohttp>=3.9.5,<4.0.0",
 ]
 
 [build-system]
