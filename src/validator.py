@@ -5,7 +5,8 @@ import threading
 import time
 import socket
 import ssl
-from urllib.parse import urlparse
+import base64
+from urllib.parse import urlparse, unquote
 from typing import Iterable, List, Optional, Set, Tuple, Dict, Any, Callable
 
 import requests
@@ -43,7 +44,7 @@ _READ_WINDOW_SECONDS = float(os.getenv("PROXXY_VALIDATOR_READ_SECONDS", "2.5"))
 _CHUNK_SIZE = int(os.getenv("PROXXY_VALIDATOR_CHUNK_SIZE", "8192"))
 _TTFB_SECONDS = float(os.getenv("PROXXY_VALIDATOR_TTFB_SECONDS", "2.0"))
 _DEFAULT_UA = os.getenv("PROXXY_VALIDATOR_USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-_TCP_PREFLIGHT = os.getenv("PROXXY_VALIDATOR_TCP_PREFLIGHT", "0")
+_TCP_PREFLIGHT = os.getenv("PROXXY_VALIDATOR_TCP_PREFLIGHT", "1")
 # Optional second URL to improve stability testing (falls back to primary when unset)
 _SECOND_URL = os.getenv("PROXXY_VALIDATOR_SECOND_URL", "").strip()
 # Connection phase timeout (connect), kept <= enforced overall timeout
@@ -51,11 +52,11 @@ _CONNECT_TIMEOUT_SECONDS = float(os.getenv("PROXXY_VALIDATOR_CONNECT_TIMEOUT", "
 # Re-check (2nd pass) read window
 _RECHECK_READ_SECONDS = float(os.getenv("PROXXY_VALIDATOR_RECHECK_READ_SECONDS", "1.5"))
 # Minimum sustained throughput after first byte (bytes/sec)
-_MIN_BPS = int(os.getenv("PROXXY_VALIDATOR_MIN_BPS", "4096"))
+_MIN_BPS = int(os.getenv("PROXXY_VALIDATOR_MIN_BPS", "8192"))
 # Require HTTP/1.1 response on validated fetch (some HTTP/1.0 paths are flaky)
-_REQUIRE_HTTP11 = os.getenv("PROXXY_VALIDATOR_REQUIRE_HTTP11", "0")
+_REQUIRE_HTTP11 = os.getenv("PROXXY_VALIDATOR_REQUIRE_HTTP11", "1")
 # OS trust TLS preflight via system CA store (replicates Schannel/curl behavior)
-_OS_TRUST_PREFLIGHT = os.getenv("PROXXY_VALIDATOR_OS_TRUST_PREFLIGHT", "0")
+_OS_TRUST_PREFLIGHT = os.getenv("PROXXY_VALIDATOR_OS_TRUST_PREFLIGHT", "1")
 
 # Global pool size (tuned per workers unless explicitly set via env)
 _POOL_SIZE = int(os.getenv("PROXXY_VALIDATOR_POOL_SIZE", "256"))
@@ -80,9 +81,13 @@ _DOUBLE_CHECK_RATIO = float(os.getenv("PROXXY_VALIDATOR_DOUBLE_CHECK_RATIO", "0.
 
 def _os_trust_tls_preflight(proxy: str, url: str) -> Tuple[bool, str]:
     """
-    Perform an OS-trust TLS preflight through the proxy using CONNECT to the target host.
-    - Uses Windows/macOS OS trust via ssl.create_default_context + load_default_certs.
-    - Fails when certificate chain is not trusted by OS (e.g., MITM or bad chain), mirroring curl/Schannel behavior.
+    OS-trust TLS preflight via HTTP/HTTPS proxy.
+
+    Steps:
+    1) TCP connect to proxy (fast-fail)
+    2) If HTTPS proxy: TLS to proxy with OS trust (min TLSv1.2)
+    3) CONNECT to target and require HTTP/1.1 200
+    4) TLS to target with OS trust (min TLSv1.2)
     Returns (ok, error_string)
     """
     try:
@@ -90,45 +95,83 @@ def _os_trust_tls_preflight(proxy: str, url: str) -> Tuple[bool, str]:
         target_host = u.hostname or ""
         target_port = u.port or 443
         pu = urlparse(proxy)
+        proxy_scheme = (pu.scheme or "").lower()
         proxy_host = pu.hostname or ""
-        proxy_port = pu.port or (443 if (pu.scheme or "").lower() == "https" else 80)
+        proxy_port = pu.port or (443 if proxy_scheme == "https" else 80)
         if not target_host or not proxy_host or not proxy_port:
             return False, "bad_host"
 
-        with socket.create_connection((proxy_host, int(proxy_port)), timeout=min(_CONNECT_TIMEOUT_SECONDS, _ENFORCED_TIMEOUT_SECONDS, 5.0)) as sock:
-            sock.settimeout(min(_ENFORCED_TIMEOUT_SECONDS, 5.0))
-            # Issue CONNECT
-            req = f"CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\nProxy-Connection: Keep-Alive\r\n\r\n"
-            sock.sendall(req.encode("ascii", "strict"))
+        with socket.create_connection((proxy_host, int(proxy_port)), timeout=min(_CONNECT_TIMEOUT_SECONDS, _ENFORCED_TIMEOUT_SECONDS, 5.0)) as base_sock:
+            base_sock.settimeout(min(_ENFORCED_TIMEOUT_SECONDS, 5.0))
+
+            conn = base_sock  # type: ignore[assignment]
+
+            if proxy_scheme == "https":
+                try:
+                    ctxp = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
+                    try:
+                        ctxp.minimum_version = ssl.TLSVersion.TLSv1_2
+                    except Exception:
+                        pass
+                    try:
+                        ctxp.load_default_certs(ssl.Purpose.SERVER_AUTH)
+                    except Exception:
+                        pass
+                    conn = ctxp.wrap_socket(base_sock, server_hostname=proxy_host)
+                except ssl.SSLCertVerificationError as e:
+                    msg = getattr(e, "verify_message", str(e)) or str(e)
+                    code = getattr(e, "verify_code", "")
+                    code_s = f"{code}:" if code else ""
+                    return False, f"proxy_tls_verify:{code_s}{msg}"
+                except Exception as e:
+                    return False, f"proxy_tls:{str(e)[:256]}"
+
+            # Proxy-Authorization (Basic) if credentials in proxy URL
+            auth_hdr = ""
+            try:
+                if pu.username is not None or pu.password is not None:
+                    user = unquote(pu.username or "")
+                    pwd = unquote(pu.password or "")
+                    token = base64.b64encode(f"{user}:{pwd}".encode("latin1")).decode("ascii")
+                    auth_hdr = f"Proxy-Authorization: Basic {token}\r\n"
+            except Exception:
+                pass
+
+            # Issue CONNECT (HTTP/1.1 required)
+            req = (
+                f"CONNECT {target_host}:{target_port} HTTP/1.1\r\n"
+                f"Host: {target_host}:{target_port}\r\n"
+                f"Proxy-Connection: Keep-Alive\r\n"
+                f"{auth_hdr}\r\n"
+            )
+            conn.sendall(req.encode("ascii", "strict"))
+
             # Read headers
             buff = b""
             while b"\r\n\r\n" not in buff and len(buff) < 8192:
-                chunk = sock.recv(1024)
+                chunk = conn.recv(1024)
                 if not chunk:
                     break
                 buff += chunk
             line = buff.split(b"\r\n", 1)[0] if buff else b""
-            if not line.startswith(b"HTTP/1.1 200") and not line.startswith(b"HTTP/1.0 200"):
+            if not line.startswith(b"HTTP/1.1 200"):
                 return False, f"connect_resp:{line.decode('latin1', 'ignore')[:128]}"
 
-            # TLS handshake with OS trust (Windows Schannel equivalent)
+            # TLS handshake with OS trust to target (works over plain or HTTPS-proxy)
             ctx = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
             try:
                 ctx.minimum_version = ssl.TLSVersion.TLSv1_2
             except Exception:
                 pass
             try:
-                # Ensure OS roots loaded (on Windows loads from Windows cert store)
                 ctx.load_default_certs(ssl.Purpose.SERVER_AUTH)
             except Exception:
                 pass
 
-            with ctx.wrap_socket(sock, server_hostname=target_host) as tls:
-                # Force handshake; will raise on untrusted roots/SAN mismatch
+            with ctx.wrap_socket(conn, server_hostname=target_host) as tls:
                 _ = tls.version()
             return True, ""
     except ssl.SSLCertVerificationError as e:
-        # Mirror useful details when available
         msg = getattr(e, "verify_message", str(e)) or str(e)
         code = getattr(e, "verify_code", "")
         code_s = f"{code}:" if code else ""
@@ -347,7 +390,7 @@ def _check_one_requests(
                 reason_code = f"http_status_{int(resp.status_code)}"
             except Exception:
                 reason_code = "http_status"
-        ok = status_ok and (total >= min_bytes) and (not read_error) and version_ok and tokens_ok
+        ok = status_ok and (total >= min_bytes) and (not read_error) and version_ok and tokens_ok and speed_ok
         try:
             elapsed = float(resp.elapsed.total_seconds()) if resp.elapsed is not None else None
         except Exception:
@@ -454,7 +497,7 @@ def _check_one_requests(
                 except Exception:
                     tokens2_ok = True
 
-                if not (status2_ok and total2 >= min_bytes2 and (not read_error2) and version2_ok and tokens2_ok):
+                if not (status2_ok and total2 >= min_bytes2 and (not read_error2) and version2_ok and tokens2_ok and speed2_ok):
                     ok = False
                 resp2.close()
                 try:
