@@ -9,6 +9,7 @@ from typing import Iterable, List, Optional, Dict, Tuple
 
 import asyncio
 import aiohttp
+from aiohttp_socks import ProxyConnector  # type: ignore[import-not-found]
 
 logger = logging.getLogger("proXXy.poolmgr")
 if not logger.handlers:
@@ -25,7 +26,7 @@ def _normalize_proxy(s: str) -> Optional[str]:
     if "://" not in s:
         s = "http://" + s
     scheme = s.split("://", 1)[0].lower()
-    if scheme not in ("http", "https"):
+    if scheme not in ("http", "https", "socks4", "socks5"):
         return None
     return s
 
@@ -349,31 +350,65 @@ class PoolManager:
                 pass
 
     async def _recheck_one_async(self, session: aiohttp.ClientSession, pxy: str, health_url: str) -> Tuple[str, bool]:
+        """
+        Re-check a single proxy against health_url.
+        - HTTP/HTTPS: reuse provided session with per-request proxy param.
+        - SOCKS4/5: create a short-lived session using ProxyConnector for this proxy.
+        """
         # Tunables
         min_bytes = int(os.getenv("PROXXY_POOL_RECHECK_MIN_BYTES", os.getenv("PROXXY_VALIDATOR_MIN_BYTES", "1024")))
         read_window = float(os.getenv("PROXXY_POOL_RECHECK_READ_SECONDS", os.getenv("PROXXY_VALIDATOR_READ_SECONDS", "2.5")))
         ttfb = float(os.getenv("PROXXY_POOL_RECHECK_TTFB_SECONDS", os.getenv("PROXXY_VALIDATOR_TTFB_SECONDS", "2.0")))
         chunk_size = int(os.getenv("PROXXY_POOL_RECHECK_CHUNK_SIZE", os.getenv("PROXXY_VALIDATOR_CHUNK_SIZE", "8192")))
+        # Choose path based on scheme
+        sch = (pxy.split("://", 1)[0].lower() if "://" in pxy else "http")
         try:
-            async with session.get(health_url, proxy=pxy, allow_redirects=True) as resp:
-                if not (200 <= resp.status < 400):
-                    return pxy, False
-                total = 0
-                seen = False
-                t_start = time.monotonic()
-                async for chunk in resp.content.iter_chunked(max(1, int(chunk_size))):
-                    now = time.monotonic()
-                    if not seen and (now - t_start) >= ttfb:
+            if sch in ("socks4", "socks5"):
+                # Build a dedicated session for this SOCKS proxy
+                timeout_total = float(os.getenv("PROXXY_POOL_RECHECK_TIMEOUT", "3.0"))
+                connect_to = float(os.getenv("PROXXY_POOL_RECHECK_CONNECT_TIMEOUT", "1.8"))
+                tmo = aiohttp.ClientTimeout(total=max(0.1, timeout_total), connect=min(connect_to, timeout_total))
+                connector2 = ProxyConnector.from_url(pxy, rdns=True)
+                async with aiohttp.ClientSession(timeout=tmo, connector=connector2, trust_env=False) as sess2:
+                    async with sess2.get(health_url, allow_redirects=True) as resp:
+                        if not (200 <= resp.status < 400):
+                            return pxy, False
+                        total = 0
+                        seen = False
+                        t_start = time.monotonic()
+                        async for chunk in resp.content.iter_chunked(max(1, int(chunk_size))):
+                            now = time.monotonic()
+                            if not seen and (now - t_start) >= ttfb:
+                                return pxy, False
+                            if not chunk:
+                                if (now - t_start) >= read_window:
+                                    break
+                                continue
+                            seen = True
+                            total += len(chunk)
+                            if total >= max(1, min_bytes) or (now - t_start) >= read_window:
+                                break
+                        return pxy, (seen and total >= max(1, min_bytes))
+            else:
+                async with session.get(health_url, proxy=pxy, allow_redirects=True) as resp:
+                    if not (200 <= resp.status < 400):
                         return pxy, False
-                    if not chunk:
-                        if (now - t_start) >= read_window:
+                    total = 0
+                    seen = False
+                    t_start = time.monotonic()
+                    async for chunk in resp.content.iter_chunked(max(1, int(chunk_size))):
+                        now = time.monotonic()
+                        if not seen and (now - t_start) >= ttfb:
+                            return pxy, False
+                        if not chunk:
+                            if (now - t_start) >= read_window:
+                                break
+                            continue
+                        seen = True
+                        total += len(chunk)
+                        if total >= max(1, min_bytes) or (now - t_start) >= read_window:
                             break
-                        continue
-                    seen = True
-                    total += len(chunk)
-                    if total >= max(1, min_bytes) or (now - t_start) >= read_window:
-                        break
-                return pxy, (seen and total >= max(1, min_bytes))
+                    return pxy, (seen and total >= max(1, min_bytes))
         except Exception:
             return pxy, False
 

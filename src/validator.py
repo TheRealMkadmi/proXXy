@@ -6,6 +6,7 @@ import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 import aiohttp
+from aiohttp_socks import ProxyConnector  # type: ignore[import-not-found]
 from loguru import logger
 
 # Logging setup (kept simple)
@@ -153,9 +154,63 @@ async def _run_stream_async(
                     q.task_done()
                     continue
 
-                prx, ok, status, err, elapsed, final_url = await _validate_one(
-                    session, proxy, url, _TTFB_SECONDS, _READ_WINDOW_SECONDS
-                )
+                # Route by scheme: HTTP(S) via shared session+proxy param; SOCKS via per-proxy ProxyConnector
+                sch = proxy.split("://", 1)[0].lower() if "://" in proxy else "http"
+                if sch in ("socks4", "socks5"):
+                    t0 = time.monotonic()
+                    status: Optional[int] = None
+                    final_url: Optional[str] = None
+                    err: Optional[str] = None
+                    ok = False
+                    try:
+                        connector2 = ProxyConnector.from_url(proxy, rdns=True)
+                        timeout_cfg2 = aiohttp.ClientTimeout(total=float(max(0.1, timeout)), connect=float(min(timeout, 5.0)))
+                        async with aiohttp.ClientSession(headers=headers, timeout=timeout_cfg2, connector=connector2, trust_env=False) as session2:
+                            async with session2.get(url, allow_redirects=True) as resp:
+                                status = resp.status
+                                final_url = str(resp.url)
+                                if not (200 <= resp.status < 400):
+                                    prx = proxy
+                                    elapsed = time.monotonic() - t0
+                                    ok = False
+                                    err = f"http_status_{resp.status}"
+                                else:
+                                    read_total = 0
+                                    seen_first = False
+                                    start_read = time.monotonic()
+                                    async for chunk in resp.content.iter_chunked(max(1, _CHUNK_SIZE)):
+                                        now2 = time.monotonic()
+                                        if not seen_first and (now2 - start_read) >= _TTFB_SECONDS:
+                                            err = "ttfb_timeout"
+                                            break
+                                        if not chunk:
+                                            if (now2 - start_read) >= _READ_WINDOW_SECONDS:
+                                                break
+                                            continue
+                                        seen_first = True
+                                        read_total += len(chunk)
+                                        if read_total >= max(1, _MIN_BYTES) or (now2 - start_read) >= _READ_WINDOW_SECONDS:
+                                            break
+                                    ok = seen_first and read_total >= max(1, _MIN_BYTES)
+                                    if not ok and err is None:
+                                        err = f"bytes={read_total}"
+                        prx = proxy
+                        elapsed = time.monotonic() - t0
+                    except asyncio.TimeoutError:
+                        prx = proxy
+                        elapsed = time.monotonic() - t0
+                        err = "timeout"
+                        ok = False
+                    except Exception as e:
+                        prx = proxy
+                        elapsed = time.monotonic() - t0
+                        err = str(e)
+                        ok = False
+                else:
+                    prx, ok, status, err, elapsed, final_url = await _validate_one(
+                        session, proxy, url, _TTFB_SECONDS, _READ_WINDOW_SECONDS
+                    )
+
                 completed += 1
                 details = {
                     "proxy": prx,

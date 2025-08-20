@@ -67,12 +67,13 @@ def _parse_upstream(uri: str) -> Optional[UpstreamProxy]:
             s = "http://" + s
         u = urlsplit(s)
         scheme = (u.scheme or "").lower()
-        if scheme not in ("http", "https"):
+        if scheme not in ("http", "https", "socks4", "socks5"):
             return None
         host = u.hostname or ""
         if not host:
             return None
-        port = u.port or (443 if scheme == "https" else 80)
+        default_port = 443 if scheme == "https" else (1080 if scheme.startswith("socks") else 80)
+        port = u.port or default_port
         return UpstreamProxy(
             scheme=scheme,
             host=host,
@@ -437,12 +438,23 @@ class TunnelProxyServer:
                 pass
     
         async def _try_connect(up: UpstreamProxy):
-            # Dial upstream and perform CONNECT handshake; return (ok, up_r, up_w, err, up)
+            # Return (ok, up_r, up_w, err, up). Supports HTTP(S) upstream proxies and SOCKS4/5.
             dial_ms = 0.0
             try:
                 t0 = time.monotonic()
-                up_r, up_w = await asyncio.wait_for(self._open_upstream(up), timeout=self.dial_timeout)
-                dial_ms = (time.monotonic() - t0) * 1000.0
+                if up.scheme in ("socks4", "socks5"):
+                    # Establish tunnel to target via SOCKS immediately (no HTTP CONNECT handshake to upstream)
+                    up_r, up_w = await asyncio.wait_for(self._open_socks_tunnel(up, host, int(port)), timeout=self.io_timeout)
+                    dial_ms = (time.monotonic() - t0) * 1000.0
+                    if _DIAG_ON:
+                        logger.info(
+                            "tunnel[%s]: socks tunnel ok upstream=%s://%s:%s dial_ms=%.0f",
+                            cid, up.scheme, up.host, up.port, dial_ms
+                        )
+                    return True, up_r, up_w, "", up
+                else:
+                    up_r, up_w = await asyncio.wait_for(self._open_upstream(up), timeout=self.dial_timeout)
+                    dial_ms = (time.monotonic() - t0) * 1000.0
             except Exception as e:
                 if _DIAG_ON:
                     logger.info(
@@ -450,8 +462,9 @@ class TunnelProxyServer:
                         cid, up.scheme, up.host, up.port, bool(up.username), e
                     )
                 return False, None, None, f"connect-upstream-failed {e}", up
+
+            # HTTP/HTTPS upstream: send CONNECT
             try:
-                # Send CONNECT to upstream proxy
                 lines = [
                     f"CONNECT {host}:{port} HTTP/1.1",
                     f"Host: {host}:{port}",
@@ -462,7 +475,7 @@ class TunnelProxyServer:
                 data = ("\r\n".join(lines) + "\r\n\r\n").encode("latin1")
                 up_w.write(data)
                 await asyncio.wait_for(up_w.drain(), timeout=self.io_timeout)
-    
+
                 # Read upstream response
                 t1 = time.monotonic()
                 status_line = await asyncio.wait_for(up_r.readline(), timeout=self.io_timeout)
@@ -721,81 +734,151 @@ class TunnelProxyServer:
         for up in candidates:
             if time.monotonic() > budget_deadline:
                 break
-            try:
-                t0 = time.monotonic()
-                up_r, up_w = await self._open_upstream(up)
-                dial_ms = (time.monotonic() - t0) * 1000.0
-            except Exception as e:
-                last_err = f"connect-upstream-failed {e}"
-                self._mark_fail(up)
-                self._mark_fail_for_target(target_label, up)
-                if _DIAG_ON:
-                    logger.info(
-                        "tunnel[%s]: http attempt fail phase=dial upstream=%s://%s:%s auth=%s err=%s",
-                        cid, up.scheme, up.host, up.port, bool(up.username), e
-                    )
-                continue
-            try:
-                # Build request to upstream (speak HTTP/1.1 to upstream proxy)
-                out_lines: List[str] = [f"{method} {abs_uri} HTTP/1.1"]
-                # Rewrite headers: drop client Proxy-* headers and Connection, add our Proxy-Authorization if needed
-                for h in raw_headers:
-                    if not h or ":" not in h:
-                        continue
-                    k, v = h.split(":", 1)
-                    kn = k.strip()
-                    kln = kn.lower()
-                    if kln.startswith("proxy-") or kln == "connection":
-                        continue
-                    out_lines.append(f"{kn}:{v}")
-                auth = up.auth_header_value()
-                if auth:
-                    out_lines.append(f"Proxy-Authorization: {auth}")
-                data = ("\r\n".join(out_lines) + "\r\n\r\n").encode("latin1")
-                up_w.write(data)
-                await asyncio.wait_for(up_w.drain(), timeout=self.io_timeout)
-
-                if _DIAG_ON:
-                    logger.info(
-                        "tunnel[%s]: http forward start upstream=%s://%s:%s auth=%s dial_ms=%.0f",
-                        cid, up.scheme, up.host, up.port, bool(up.username), dial_ms
-                    )
-                # After sending headers, relay bidirectionally (this supports bodies and simple keep-alive)
-                self._clear_fail(up)
-                self._clear_fail_for_target(target_label, up)
-                t_pipe0 = time.monotonic()
-                await self._pipe_bidirectional(
-                    client_r,
-                    client_w,
-                    up_r,
-                    up_w,
-                    cid=cid,
-                    label=f"HTTP {scheme}://{authority} via {up.scheme}://{up.host}:{up.port}",
-                )
-                dur_ms = (time.monotonic() - t_pipe0) * 1000.0
-                if _DIAG_ON:
-                    logger.info(
-                        "tunnel[%s]: http forward closed upstream=%s://%s:%s dur_ms=%.0f",
-                        cid, up.scheme, up.host, up.port, dur_ms
-                    )
-                return
-            except Exception as e:
-                last_err = f"upstream-error {e}"
-                self._mark_fail(up)
+            if up.scheme in ("http", "https"):
                 try:
-                    up_w.close()
+                    t0 = time.monotonic()
+                    up_r, up_w = await self._open_upstream(up)
+                    dial_ms = (time.monotonic() - t0) * 1000.0
+                except Exception as e:
+                    last_err = f"connect-upstream-failed {e}"
+                    self._mark_fail(up)
+                    self._mark_fail_for_target(target_label, up)
+                    if _DIAG_ON:
+                        logger.info(
+                            "tunnel[%s]: http attempt fail phase=dial upstream=%s://%s:%s auth=%s err=%s",
+                            cid, up.scheme, up.host, up.port, bool(up.username), e
+                        )
+                    continue
+                try:
+                    # Build request to upstream (speak HTTP/1.1 to upstream proxy)
+                    out_lines: List[str] = [f"{method} {abs_uri} HTTP/1.1"]
+                    # Rewrite headers: drop client Proxy-* headers and Connection, add our Proxy-Authorization if needed
+                    for h in raw_headers:
+                        if not h or ":" not in h:
+                            continue
+                        k, v = h.split(":", 1)
+                        kn = k.strip()
+                        kln = kn.lower()
+                        if kln.startswith("proxy-") or kln == "connection":
+                            continue
+                        out_lines.append(f"{kn}:{v}")
+                    auth = up.auth_header_value()
+                    if auth:
+                        out_lines.append(f"Proxy-Authorization: {auth}")
+                    data = ("\r\n".join(out_lines) + "\r\n\r\n").encode("latin1")
+                    up_w.write(data)
+                    await asyncio.wait_for(up_w.drain(), timeout=self.io_timeout)
+
+                    if _DIAG_ON:
+                        logger.info(
+                            "tunnel[%s]: http forward start upstream=%s://%s:%s auth=%s dial_ms=%.0f",
+                            cid, up.scheme, up.host, up.port, bool(up.username), dial_ms
+                        )
+                    # After sending headers, relay bidirectionally (this supports bodies and simple keep-alive)
+                    self._clear_fail(up)
+                    self._clear_fail_for_target(target_label, up)
+                    t_pipe0 = time.monotonic()
+                    await self._pipe_bidirectional(
+                        client_r,
+                        client_w,
+                        up_r,
+                        up_w,
+                        cid=cid,
+                        label=f"HTTP {scheme}://{authority} via {up.scheme}://{up.host}:{up.port}",
+                    )
+                    dur_ms = (time.monotonic() - t_pipe0) * 1000.0
+                    if _DIAG_ON:
+                        logger.info(
+                            "tunnel[%s]: http forward closed upstream=%s://%s:%s dur_ms=%.0f",
+                            cid, up.scheme, up.host, up.port, dur_ms
+                        )
+                    return
+                except Exception as e:
+                    last_err = f"upstream-error {e}"
+                    self._mark_fail(up)
                     try:
-                        await up_w.wait_closed()
+                        up_w.close()
+                        try:
+                            await up_w.wait_closed()
+                        except Exception:
+                            pass
                     except Exception:
                         pass
-                except Exception:
-                    pass
-                if _DIAG_ON:
-                    logger.info(
-                        "tunnel[%s]: http attempt fail phase=forward upstream=%s://%s:%s auth=%s err=%s",
-                        cid, up.scheme, up.host, up.port, bool(up.username), e
+                    if _DIAG_ON:
+                        logger.info(
+                            "tunnel[%s]: http attempt fail phase=forward upstream=%s://%s:%s auth=%s err=%s",
+                            cid, up.scheme, up.host, up.port, bool(up.username), e
+                        )
+                    continue
+            else:
+                # SOCKS upstream: connect to origin via SOCKS and forward origin-form request (HTTP only)
+                try:
+                    try:
+                        u2 = urlsplit(abs_uri)
+                        dst_host = u2.hostname or authority
+                        dst_port = u2.port or 80
+                        path = u2.path or "/"
+                        if u2.query:
+                            path = f"{path}?{u2.query}"
+                    except Exception:
+                        dst_host = authority.split(":")[0]
+                        dst_port = 80
+                        path = "/"
+                    if scheme == "https":
+                        # For HTTPS targets use CONNECT; non-CONNECT HTTPS is not supported over SOCKS forward
+                        last_err = "https-over-socks-forward-unsupported"
+                        if _DIAG_ON:
+                            logger.info("tunnel[%s]: reject http-forward over socks to https authority=%s", cid, authority)
+                        continue
+                    t0 = time.monotonic()
+                    up_r, up_w = await self._open_socks_tunnel(up, dst_host, int(dst_port))
+                    dial_ms = (time.monotonic() - t0) * 1000.0
+                    out_lines: List[str] = [f"{method} {path} HTTP/1.1"]
+                    for h in raw_headers:
+                        if not h or ":" not in h:
+                            continue
+                        k, v = h.split(":", 1)
+                        kn = k.strip()
+                        kln = kn.lower()
+                        if kln.startswith("proxy-") or kln == "connection":
+                            continue
+                        out_lines.append(f"{kn}:{v}")
+                    data = ("\r\n".join(out_lines) + "\r\n\r\n").encode("latin1")
+                    up_w.write(data)
+                    await asyncio.wait_for(up_w.drain(), timeout=self.io_timeout)
+
+                    if _DIAG_ON:
+                        logger.info(
+                            "tunnel[%s]: http forward start via socks upstream=%s://%s:%s dial_ms=%.0f",
+                            cid, up.scheme, up.host, up.port, dial_ms
+                        )
+                    self._clear_fail(up)
+                    self._clear_fail_for_target(target_label, up)
+                    t_pipe0 = time.monotonic()
+                    await self._pipe_bidirectional(
+                        client_r,
+                        client_w,
+                        up_r,
+                        up_w,
+                        cid=cid,
+                        label=f"HTTP {scheme}://{authority} via {up.scheme}://{up.host}:{up.port}",
                     )
-                continue
+                    dur_ms = (time.monotonic() - t_pipe0) * 1000.0
+                    if _DIAG_ON:
+                        logger.info(
+                            "tunnel[%s]: http forward closed via socks upstream=%s://%s:%s dur_ms=%.0f",
+                            cid, up.scheme, up.host, up.port, dur_ms
+                        )
+                    return
+                except Exception as e:
+                    last_err = f"socks-forward-error {e}"
+                    self._mark_fail(up)
+                    if _DIAG_ON:
+                        logger.info(
+                            "tunnel[%s]: http attempt fail via socks upstream=%s://%s:%s err=%s",
+                            cid, up.scheme, up.host, up.port, e
+                        )
+                    continue
 
         logger.warning("tunnel[%s]: HTTP forward failed authority=%s err=%s", cid, authority, last_err)
         await self._respond(client_w, 502, "Bad Gateway")
@@ -956,6 +1039,100 @@ class TunnelProxyServer:
                 pass
         r, w = await asyncio.wait_for(asyncio.open_connection(host=up.host, port=up.port, ssl=ssl_ctx), timeout=self.dial_timeout)
         return r, w
+
+    async def _open_socks_tunnel(self, up: UpstreamProxy, host: str, port: int) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """
+        Connect to SOCKS4/5 proxy and establish a tunnel to (host, port).
+        Returns the reader/writer streams for the established tunnel.
+        """
+        try:
+            r, w = await asyncio.wait_for(asyncio.open_connection(host=up.host, port=up.port, ssl=None), timeout=self.dial_timeout)
+        except Exception as e:
+            raise RuntimeError(f"dial-socks-failed {e}") from e
+        try:
+            if up.scheme == "socks5":
+                await asyncio.wait_for(self._socks5_handshake(r, w, up, host, port), timeout=self.io_timeout)
+            else:
+                await asyncio.wait_for(self._socks4a_handshake(r, w, up, host, port), timeout=self.io_timeout)
+            return r, w
+        except Exception as e:
+            try:
+                w.close()
+                try:
+                    await w.wait_closed()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            raise
+
+    async def _socks5_handshake(self, r: asyncio.StreamReader, w: asyncio.StreamWriter, up: UpstreamProxy, host: str, port: int) -> None:
+        # Greeting
+        methods = [0x00]
+        if up.username is not None:
+            methods = [0x00, 0x02]
+        w.write(bytes([0x05, len(methods), *methods]))
+        await w.drain()
+        data = await r.readexactly(2)
+        if len(data) != 2 or data[0] != 0x05:
+            raise RuntimeError("socks5-bad-greeting")
+        method = data[1]
+        if method == 0x02:
+            # Username/Password auth
+            uname = (up.username or "").encode("utf-8")
+            pwd = (up.password or "").encode("utf-8")
+            if len(uname) > 255 or len(pwd) > 255:
+                raise RuntimeError("socks5-cred-too-long")
+            w.write(bytes([0x01, len(uname)]) + uname + bytes([len(pwd)]) + pwd)
+            await w.drain()
+            a = await r.readexactly(2)
+            if len(a) != 2 or a[1] != 0x00:
+                raise RuntimeError("socks5-auth-failed")
+        elif method == 0x00:
+            pass
+        else:
+            raise RuntimeError("socks5-no-supported-auth")
+
+        # CONNECT request with domain name
+        host_b = host.encode("idna")
+        if len(host_b) > 255:
+            raise RuntimeError("socks5-hostname-too-long")
+        req = bytearray()
+        req += b"\x05\x01\x00"  # VER=5, CMD=CONNECT, RSV=0
+        req += b"\x03" + bytes([len(host_b)]) + host_b  # ATYP=DOMAIN
+        req += bytes([(port >> 8) & 0xFF, port & 0xFF])
+        w.write(req)
+        await w.drain()
+        # Reply: VER, REP, RSV, ATYP, BND.ADDR, BND.PORT
+        hdr = await r.readexactly(4)
+        if hdr[1] != 0x00:
+            raise RuntimeError(f"socks5-connect-failed-rep={hdr[1]}")
+        atyp = hdr[3]
+        if atyp == 0x01:
+            await r.readexactly(4)
+        elif atyp == 0x03:
+            l = await r.readexactly(1)
+            await r.readexactly(l[0])
+        elif atyp == 0x04:
+            await r.readexactly(16)
+        await r.readexactly(2)  # port
+
+    async def _socks4a_handshake(self, r: asyncio.StreamReader, w: asyncio.StreamWriter, up: UpstreamProxy, host: str, port: int) -> None:
+        # SOCKS4a: use 0.0.0.1 and append hostname
+        uname = (up.username or "").encode("utf-8")
+        host_b = host.encode("idna")
+        req = bytearray()
+        req += b"\x04\x01"  # VN=4, CD=1 CONNECT
+        req += bytes([(port >> 8) & 0xFF, port & 0xFF])
+        req += b"\x00\x00\x00\x01"
+        req += uname + b"\x00"
+        req += host_b + b"\x00"
+        w.write(req)
+        await w.drain()
+        # Reply: VN(0x00), CD(0x5a success)
+        rep = await r.readexactly(8)
+        if len(rep) != 8 or rep[1] != 0x5A:
+            raise RuntimeError("socks4-connect-failed")
 
     def _split_host_port(self, hp: str) -> Tuple[str, Optional[int]]:
         s = (hp or "").strip()

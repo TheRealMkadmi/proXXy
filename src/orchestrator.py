@@ -71,8 +71,10 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
                 logger.info("scrape.config: verify_ssl=%s ua=%s", verify_ssl_env, bool(ua_env))
             except Exception:
                 pass
+            enable_socks = os.environ.get("PROXXY_ENABLE_SOCKS", "1").strip().lower() not in ("0", "false", "no")
+            protocols = ("HTTP", "HTTPS") + (("SOCKS4", "SOCKS5") if enable_socks else ())
             scrapers = [
-                StaticUrlTextScraper(protocols=("HTTP", "HTTPS"), verify_ssl=verify_ssl_env),
+                StaticUrlTextScraper(protocols=protocols, verify_ssl=verify_ssl_env),
                 ProxyDBScraper(protocol="http", anon_levels=(2, 4), country="", pages=1, user_agent=ua_env, verify_ssl=verify_ssl_env),
             ]
             seen = set()
@@ -110,7 +112,7 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
                     s = f"http://{s}"
                 else:
                     sch = s.split("://", 1)[0]
-                    if sch not in ("http", "https"):
+                    if sch not in ("http", "https", "socks4", "socks5"):
                         continue
                 candidates.append(s)
             # Deduplicate by endpoint, prefer http:// when both exist
@@ -128,7 +130,9 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
                         by_endpoint[endpoint] = p
                         order.append(endpoint)
                     else:
-                        if p.startswith("http://") and not prev.startswith("http://"):
+                        new_rank = (0 if p.startswith("http://") else 1 if p.startswith("https://") else 2 if p.startswith("socks4://") or p.startswith("socks5://") else 3)
+                        prev_rank = (0 if prev.startswith("http://") else 1 if prev.startswith("https://") else 2 if prev.startswith("socks4://") or prev.startswith("socks5://") else 3)
+                        if new_rank < prev_rank:
                             by_endpoint[endpoint] = p
                 except Exception:
                     continue

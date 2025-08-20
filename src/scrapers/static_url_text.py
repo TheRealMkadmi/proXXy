@@ -55,14 +55,14 @@ class StaticUrlTextScraper:
                 err_urls = 0
 
                 tasks = []
-                urls: List[str] = []
-                for _, items in subset.items():
+                entries: List[tuple[str, str]] = []
+                for proto, items in subset.items():
                     for it in items:
                         url = it.strip() if isinstance(it, str) else str(it.get("url", "")).strip() if isinstance(it, dict) else ""
                         if url:
-                            urls.append(url)
+                            entries.append((str(proto).upper(), url))
 
-                async def fetch(url: str):
+                async def fetch(proto: str, url: str):
                     nonlocal attempted, ok_urls, http_fail, err_urls
                     async with sem:
                         attempted += 1
@@ -72,16 +72,22 @@ class StaticUrlTextScraper:
                                     http_fail += 1
                                     return
                                 text = await resp.text(errors="ignore")
+                                prefix = ""
+                                if proto == "SOCKS4":
+                                    prefix = "socks4://"
+                                elif proto == "SOCKS5":
+                                    prefix = "socks5://"
                                 for p in extract_proxies(text or ""):
-                                    if p not in seen:
-                                        seen.add(p)
-                                        out.append(p)
+                                    val = (prefix + p) if prefix else p
+                                    if val not in seen:
+                                        seen.add(val)
+                                        out.append(val)
                                 ok_urls += 1
                         except Exception:
                             err_urls += 1
 
-                for u in urls:
-                    tasks.append(asyncio.create_task(fetch(u)))
+                for proto, u in entries:
+                    tasks.append(asyncio.create_task(fetch(proto, u)))
 
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
