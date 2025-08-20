@@ -101,7 +101,15 @@ async def _run_stream_async(
     user_agent: Optional[str],
     total: Optional[int],
     stop_event: Optional[threading.Event],
+    *,
+    store_results: bool,
 ) -> Tuple[List[str], List[Dict[str, Any]]]:
+    """
+    Bounded worker-pool validator:
+    - Exactly `workers` consumers pull from an asyncio.Queue (maxsize = workers * 2).
+    - Avoids creating one Task per proxy (prevents memory/GC pressure).
+    - Optionally stores results (disable in streaming to avoid O(n) memory growth).
+    """
     seen: Set[str] = set()
     results: List[Dict[str, Any]] = []
     live_list: List[str] = []
@@ -113,30 +121,38 @@ async def _run_stream_async(
         "Connection": "keep-alive",
     }
 
-    # Concurrency via semaphore
-    sem = asyncio.Semaphore(max(1, int(workers)))
-
+    # Concurrency bounded by number of consumers; also align connector limits
+    workers = max(1, int(workers))
     timeout_cfg = aiohttp.ClientTimeout(total=float(max(0.1, timeout)), connect=float(min(timeout, 5.0)))
+    connector = aiohttp.TCPConnector(limit=workers, limit_per_host=workers)
 
-    async with aiohttp.ClientSession(headers=headers, timeout=timeout_cfg, trust_env=False) as session:
-        start = time.time()
-        last_log = time.monotonic()
-        completed = 0
-        peak_inflight = 0
+    start = time.time()
+    last_log = time.monotonic()
+    completed = 0
 
-        async def worker(p: str):
-            nonlocal completed, peak_inflight, last_log
-            async with sem:
+    async with aiohttp.ClientSession(headers=headers, timeout=timeout_cfg, connector=connector, trust_env=False) as session:
+        q: asyncio.Queue[Optional[str]] = asyncio.Queue(maxsize=max(1, workers * 2))
+
+        async def consume():
+            nonlocal completed, last_log
+            while True:
+                try:
+                    p = await q.get()
+                except Exception:
+                    break
+                if p is None:
+                    q.task_done()
+                    break
+                # Respect external stop: drop remaining work quickly
+                if stop_event is not None and stop_event.is_set():
+                    q.task_done()
+                    continue
+
                 proxy = p.strip()
                 if not proxy:
-                    return
-                if proxy in seen:
-                    return
-                seen.add(proxy)
-                # Short-circuit on external stop
-                if stop_event is not None and stop_event.is_set():
-                    return
-                # Validate
+                    q.task_done()
+                    continue
+
                 prx, ok, status, err, elapsed, final_url = await _validate_one(
                     session, proxy, url, _TTFB_SECONDS, _READ_WINDOW_SECONDS
                 )
@@ -155,17 +171,18 @@ async def _run_stream_async(
                     except Exception:
                         pass
                     live_list.append(prx)
-                    results.append({"proxy": prx, "status": status, "elapsed": elapsed, "final_url": final_url})
+                    if store_results:
+                        results.append({"proxy": prx, "status": status, "elapsed": elapsed, "final_url": final_url})
                 else:
                     if on_result is not None:
-                        results.append({
-                            "proxy": prx,
-                            "status": status,
-                            "elapsed": elapsed,
-                            "final_url": final_url,
-                            "error": err,
-                        })
-                    if on_result is not None:
+                        if store_results:
+                            results.append({
+                                "proxy": prx,
+                                "status": status,
+                                "elapsed": elapsed,
+                                "final_url": final_url,
+                                "error": err,
+                            })
                         try:
                             on_result(details)
                         except Exception:
@@ -180,7 +197,7 @@ async def _run_stream_async(
                         logger.debug(
                             "progress: {}/{} ({:.1f}%) done | live={} | rate={:.1f}/s | inflight~{}",
                             completed,
-                            total,
+                            total or 0,
                             pct,
                             len(live_list),
                             rate,
@@ -195,29 +212,49 @@ async def _run_stream_async(
                             int(workers),
                         )
                     last_log = now
+                q.task_done()
 
-        tasks: List[asyncio.Task] = []
+        consumers = [asyncio.create_task(consume()) for _ in range(workers)]
+
+        # Producer inline: enqueue unique, non-empty proxies
         for p in proxies:
             if stop_event is not None and stop_event.is_set():
                 break
-            t = asyncio.create_task(worker(p))
-            tasks.append(t)
-            if len(tasks) > peak_inflight:
-                peak_inflight = len(tasks)
+            s = (p or "").strip()
+            if not s:
+                continue
+            if s in seen:
+                continue
+            seen.add(s)
+            await q.put(s)
 
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        # Signal completion
+        for _ in range(len(consumers)):
+            await q.put(None)
 
-    results.sort(key=lambda r: (float("inf") if r.get("elapsed") is None else r["elapsed"]))
+        # Wait for queue to drain and consumers to exit
+        try:
+            await q.join()
+        except Exception:
+            pass
+        try:
+            await asyncio.gather(*consumers, return_exceptions=True)
+        except Exception:
+            pass
+
+    # Keep API: sort results by elapsed (if collected)
+    if results:
+        results.sort(key=lambda r: (float("inf") if r.get("elapsed") is None else r["elapsed"]))
+
     elapsed_total = time.time() - start
     logger.success(
         "done(stream): checked~{} live={} elapsed={:.1f}s peak_workers={}",
         len(seen),
         len(live_list),
         elapsed_total,
-        int(max(1, workers)),
+        int(workers),
     )
-    return list(live_list), results
+    return list(live_list), (results if store_results else [])
 
 
 def check_proxies(
@@ -246,6 +283,7 @@ def check_proxies(
             user_agent=user_agent,
             total=total,
             stop_event=None,
+            store_results=True,  # collect results for non-streaming API
         )
     )
     return live, results
@@ -275,5 +313,6 @@ def check_proxies_stream(
             user_agent=user_agent,
             total=total,
             stop_event=stop_event,
+            store_results=False,  # avoid O(n) accumulation in streaming mode
         )
     )

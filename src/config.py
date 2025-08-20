@@ -35,7 +35,7 @@ class OrchestratorConfig:
 def load_config_from_env() -> OrchestratorConfig:
     output_dir = os.environ.get("PROXXY_OUTPUT_DIR", "output")
     validation_url = os.environ.get("PROXXY_VALIDATION_URL", "https://www.netflix.com/")
-    validator_workers = int(os.environ.get("PROXXY_VALIDATOR_WORKERS", "1024"))
+    validator_workers = int(os.environ.get("PROXXY_VALIDATOR_WORKERS", "256"))
     validator_timeout = float(os.environ.get("PROXXY_VALIDATOR_TIMEOUT", "5.0"))
 
     proxy_host = os.environ.get("PROXXY_PROXY_HOST", "127.0.0.1")
