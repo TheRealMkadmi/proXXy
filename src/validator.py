@@ -127,8 +127,32 @@ async def _run_stream_async(
     timeout_cfg = aiohttp.ClientTimeout(total=float(max(0.1, timeout)), connect=float(min(timeout, 5.0)))
     connector = aiohttp.TCPConnector(limit=workers, limit_per_host=workers)
 
+    # Windows-specific: suppress noisy WinError 10054 (connection reset by peer) from asyncio Proactor callbacks
+    try:
+        loop = asyncio.get_running_loop()
+        if os.name == "nt":
+            def _win_exc_handler(loop, context):
+                exc = context.get("exception")
+                msg = context.get("message", "")
+                if isinstance(exc, ConnectionResetError) and ("10054" in str(exc) or getattr(exc, "errno", None) == 10054):
+                    try:
+                        # Track a per-loop counter so progress logs can include it
+                        loop._proxx_resets = getattr(loop, "_proxx_resets", 0) + 1  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                    logger.debug("asyncio: suppressed WinError 10054: {}", msg)
+                    return
+                loop.default_exception_handler(context)
+            try:
+                loop.set_exception_handler(_win_exc_handler)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     start = time.time()
     last_log = time.monotonic()
+    progress_every = float(os.getenv("PROXXY_VALIDATOR_PROGRESS_EVERY", os.getenv("PROXXY_PROGRESS_EVERY", "3")))
     completed = 0
 
     async with aiohttp.ClientSession(headers=headers, timeout=timeout_cfg, connector=connector, trust_env=False) as session:
@@ -212,6 +236,10 @@ async def _run_stream_async(
                     )
 
                 completed += 1
+                try:
+                    resets = int(getattr(asyncio.get_running_loop(), "_proxx_resets", 0))
+                except Exception:
+                    resets = 0
                 details = {
                     "proxy": prx,
                     "ok": ok,
@@ -219,6 +247,7 @@ async def _run_stream_async(
                     "error": err,
                     "elapsed": elapsed,
                     "final_url": final_url,
+                    "resets": resets,
                 }
                 if ok:
                     try:
@@ -244,27 +273,29 @@ async def _run_stream_async(
                             pass
 
                 now = time.monotonic()
-                if now - last_log >= 1.0 or (total and completed and completed % 100 == 0):
+                if now - last_log >= max(0.5, progress_every):
                     elapsed_total = max(1e-6, time.time() - start)
                     rate = completed / elapsed_total
                     pct = (completed / total * 100.0) if total else None
                     if pct is not None:
                         logger.debug(
-                            "progress: {}/{} ({:.1f}%) done | live={} | rate={:.1f}/s | inflight~{}",
+                            "progress: {}/{} ({:.1f}%) done | live={} | rate={:.1f}/s | inflight~{} | resets={}",
                             completed,
                             total or 0,
                             pct,
                             len(live_list),
                             rate,
                             int(workers),
+                            int(getattr(asyncio.get_running_loop(), "_proxx_resets", 0)),
                         )
                     else:
                         logger.debug(
-                            "progress: {} done | live={} | rate={:.1f}/s | inflight~{}",
+                            "progress: {} done | live={} | rate={:.1f}/s | inflight~{} | resets={}",
                             completed,
                             len(live_list),
                             rate,
                             int(workers),
+                            int(getattr(asyncio.get_running_loop(), "_proxx_resets", 0)),
                         )
                     last_log = now
                 q.task_done()

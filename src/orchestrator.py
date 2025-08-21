@@ -19,13 +19,40 @@ logger = logging.getLogger("proXXy.orchestrator")
 def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, status_queue=None, pool_queue=None) -> None:
     """
     Throughput-first producer loop:
-    - Scrape HTTP/HTTPS sources
+    - Scrape HTTP/HTTPS/SOCKS sources
     - Read, normalize, dedupe by endpoint
     - Validate candidates (streaming)
     - Publish live proxies to pool
     - Emit basic cycle metrics
     """
     cfg = config or load_config_from_env()
+
+    # Windows-specific: install an asyncio exception handler to downgrade WinError 10054 noise to DEBUG
+    try:
+        import asyncio  # local import to avoid polluting module scope
+        if os.name == "nt":
+            loop = asyncio.get_event_loop()
+            def _win_exc_handler(loop, context):
+                exc = context.get("exception")
+                msg = context.get("message", "")
+                if isinstance(exc, ConnectionResetError) and ("10054" in str(exc) or getattr(exc, "errno", None) == 10054):
+                    try:
+                        # Track a simple counter at function attribute level for cycle summaries
+                        produce_process_loop._win_resets = getattr(produce_process_loop, "_win_resets", 0) + 1  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                    try:
+                        logger.debug("asyncio: suppressed WinError 10054: %s", msg)
+                    except Exception:
+                        pass
+                    return
+                loop.default_exception_handler(context)
+            try:
+                loop.set_exception_handler(_win_exc_handler)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     # Ensure sibling imports when spawned on Windows (spawn)
     try:
@@ -58,6 +85,7 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
         scrape_dt = 0.0
         validate_dt = 0.0
         published_count = 0
+        resets_seen = 0
 
         # 1) Scrape using pluggable scrapers (in-memory aggregation)
         proxies_all: List[str] = []
@@ -68,7 +96,7 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
             verify_ssl_env = os.environ.get("PROXXY_SCRAPER_VERIFY_SSL", "1").lower() not in ("0", "false", "no")
             ua_env = os.environ.get("PROXXY_SCRAPER_UA", None)
             try:
-                logger.info("scrape.config: verify_ssl=%s ua=%s", verify_ssl_env, bool(ua_env))
+                logger.debug("scrape.config: verify_ssl=%s ua=%s", verify_ssl_env, bool(ua_env))
             except Exception:
                 pass
             enable_socks = os.environ.get("PROXXY_ENABLE_SOCKS", "1").strip().lower() not in ("0", "false", "no")
@@ -100,7 +128,7 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
         except Exception as e:
             logger.exception("scrape: failed: %s", e)
 
-        # 2) Normalize to HTTP/HTTPS URL forms for validator
+        # 2) Normalize to HTTP/HTTPS/SOCKS URL forms for validator
         candidates: List[str] = []
         try:
             for item in proxies_all:
@@ -164,6 +192,7 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
             # Flush to pool early so proxy can start once min_upstreams are available
             flush_threshold = max(1, int(getattr(cfg, "min_upstreams", 10)))
             last_flush_ts = time.monotonic()
+            progress_every = float(os.getenv("PROXXY_PROGRESS_EVERY", "3"))
 
             def _flush_batch():
                 nonlocal batch, publish_size, published, last_flush_ts
@@ -207,11 +236,25 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
                         _flush_batch()
 
             def _on_result(details: dict) -> None:
-                nonlocal completed_count, last_progress_emit
+                nonlocal completed_count, last_progress_emit, resets_seen
                 completed_count += 1
+                try:
+                    if isinstance(details, dict) and ("resets" in details):
+                        resets_seen = int(details.get("resets") or resets_seen)
+                except Exception:
+                    pass
                 now = time.monotonic()
-                if (completed_count % 500 == 0) or (now - last_progress_emit >= 1.0) or (completed_count >= candidates_count):
+                if (completed_count % 500 == 0) or (now - last_progress_emit >= progress_every) or (completed_count >= candidates_count):
                     last_progress_emit = now
+                    logger.info(
+                        "validate.progress %d/%d (%.1f%%) live=%d rate=%.1f/s resets=%d",
+                        completed_count,
+                        candidates_count,
+                        (completed_count / candidates_count * 100.0) if candidates_count else 0.0,
+                        published_count,
+                        (completed_count / max(1e-6, time.perf_counter() - t_val0)),
+                        resets_seen,
+                    )
                     try:
                         emit({
                             "type": "validate_progress",
@@ -219,6 +262,7 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
                             "live": published_count,
                             "total": candidates_count,
                             "workers": int(getattr(cfg, "validator_workers", 0) or 0),
+                            "resets": int(resets_seen),
                             "ts": time.time(),
                         })
                     except Exception:
@@ -263,6 +307,7 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
             "validate_dt": validate_dt,
             "combined_input_size": max(0, combined_size),
             "workers": 0,
+            "resets": int(resets_seen),
             "ts": time.time(),
         })
 

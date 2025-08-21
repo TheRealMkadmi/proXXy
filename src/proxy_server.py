@@ -25,7 +25,7 @@ if not logger.handlers:
     )
 
 # Diagnostics controls
-_DIAG_STR = os.getenv("PROXXY_TUNNEL_DIAG", "basic").strip().lower()
+_DIAG_STR = os.getenv("PROXXY_TUNNEL_DIAG", "off").strip().lower()
 _DIAG_ON = _DIAG_STR not in ("0", "off", "false", "no")
 _DIAG_VERBOSE = _DIAG_STR in ("verbose", "v", "debug")
 _FAIL_LOG_EVERY = max(1, int(os.getenv("PROXXY_TUNNEL_FAIL_LOG_EVERY", "1")))
