@@ -22,16 +22,13 @@ logger.add(sys.stderr, level=_LOG_LEVEL, backtrace=False, diagnose=False, enqueu
 OnLiveFn = Callable[[str, Dict[str, Any]], None]
 OnResultFn = Callable[[Dict[str, Any]], None]
 
-# Simple tunables
-_DEFAULT_TARGET = os.getenv("PROXXY_VALIDATION_URL", "https://www.netflix.com/")
-_DEFAULT_UA = os.getenv(
-    "PROXXY_VALIDATOR_USER_AGENT",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+# Simple defaults (kept constant; actual values provided by caller)
+DEFAULT_VALIDATION_URL = "https://www.netflix.com/"
+DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
 )
-_MIN_BYTES = int(os.getenv("PROXXY_VALIDATOR_MIN_BYTES", "1024"))
-_READ_WINDOW_SECONDS = float(os.getenv("PROXXY_VALIDATOR_READ_SECONDS", "2.5"))
-_TTFB_SECONDS = float(os.getenv("PROXXY_VALIDATOR_TTFB_SECONDS", "2.0"))
-_CHUNK_SIZE = int(os.getenv("PROXXY_VALIDATOR_CHUNK_SIZE", "8192"))
 
 
 async def _validate_one(
@@ -40,6 +37,8 @@ async def _validate_one(
     url: str,
     ttfb_seconds: float,
     read_seconds: float,
+    chunk_size: int,
+    min_bytes: int,
 ) -> Tuple[str, bool, Optional[int], Optional[str], Optional[float], Optional[str]]:
     t0 = time.monotonic()
     status: Optional[int] = None
@@ -60,7 +59,7 @@ async def _validate_one(
             total = 0
             seen_first = False
             start_read = time.monotonic()
-            async for chunk in resp.content.iter_chunked(max(1, _CHUNK_SIZE)):
+            async for chunk in resp.content.iter_chunked(max(1, chunk_size)):
                 now = time.monotonic()
                 if not seen_first and (now - start_read) >= ttfb_seconds:
                     err = "ttfb_timeout"
@@ -71,10 +70,10 @@ async def _validate_one(
                     continue
                 seen_first = True
                 total += len(chunk)
-                if total >= max(1, _MIN_BYTES) or (now - start_read) >= read_seconds:
+                if total >= max(1, min_bytes) or (now - start_read) >= read_seconds:
                     break
 
-            ok = seen_first and total >= max(1, _MIN_BYTES)
+            ok = seen_first and total >= max(1, min_bytes)
             if not ok and err is None:
                 err = f"bytes={total}"
     except asyncio.TimeoutError:
@@ -100,6 +99,12 @@ async def _run_stream_async(
     on_live: OnLiveFn,
     on_result: Optional[OnResultFn],
     user_agent: Optional[str],
+    accept_language: str,
+    ttfb_seconds: float,
+    read_seconds: float,
+    min_bytes: int,
+    chunk_size: int,
+    progress_every: float,
     total: Optional[int],
     stop_event: Optional[threading.Event],
     *,
@@ -117,8 +122,8 @@ async def _run_stream_async(
 
     headers = {
         "Accept": "*/*",
-        "Accept-Language": os.getenv("PROXXY_VALIDATOR_ACCEPT_LANGUAGE", "en-US,en;q=0.9"),
-        "User-Agent": user_agent or _DEFAULT_UA,
+        "Accept-Language": accept_language,
+        "User-Agent": user_agent or DEFAULT_UA,
         "Connection": "keep-alive",
     }
 
@@ -152,7 +157,6 @@ async def _run_stream_async(
 
     start = time.time()
     last_log = time.monotonic()
-    progress_every = float(os.getenv("PROXXY_VALIDATOR_PROGRESS_EVERY", os.getenv("PROXXY_PROGRESS_EVERY", "3")))
     completed = 0
 
     async with aiohttp.ClientSession(headers=headers, timeout=timeout_cfg, connector=connector, trust_env=False) as session:
@@ -202,20 +206,20 @@ async def _run_stream_async(
                                     read_total = 0
                                     seen_first = False
                                     start_read = time.monotonic()
-                                    async for chunk in resp.content.iter_chunked(max(1, _CHUNK_SIZE)):
+                                    async for chunk in resp.content.iter_chunked(max(1, chunk_size)):
                                         now2 = time.monotonic()
-                                        if not seen_first and (now2 - start_read) >= _TTFB_SECONDS:
+                                        if not seen_first and (now2 - start_read) >= ttfb_seconds:
                                             err = "ttfb_timeout"
                                             break
                                         if not chunk:
-                                            if (now2 - start_read) >= _READ_WINDOW_SECONDS:
+                                            if (now2 - start_read) >= read_seconds:
                                                 break
                                             continue
                                         seen_first = True
                                         read_total += len(chunk)
-                                        if read_total >= max(1, _MIN_BYTES) or (now2 - start_read) >= _READ_WINDOW_SECONDS:
+                                        if read_total >= max(1, min_bytes) or (now2 - start_read) >= read_seconds:
                                             break
-                                    ok = seen_first and read_total >= max(1, _MIN_BYTES)
+                                    ok = seen_first and read_total >= max(1, min_bytes)
                                     if not ok and err is None:
                                         err = f"bytes={read_total}"
                         prx = proxy
@@ -232,7 +236,7 @@ async def _run_stream_async(
                         ok = False
                 else:
                     prx, ok, status, err, elapsed, final_url = await _validate_one(
-                        session, proxy, url, _TTFB_SECONDS, _READ_WINDOW_SECONDS
+                        session, proxy, url, ttfb_seconds, read_seconds, chunk_size, min_bytes
                     )
 
                 completed += 1
@@ -350,10 +354,16 @@ def check_proxies(
     timeout: float,
     verify_ssl: bool = True,  # kept for compatibility; aiohttp verifies by default
     user_agent: Optional[str] = None,
+    accept_language: str = "en-US,en;q=0.9",
+    ttfb_seconds: float = 2.0,
+    read_seconds: float = 2.5,
+    min_bytes: int = 1024,
+    chunk_size: int = 8192,
+    progress_every: float = 3.0,
     total: Optional[int] = None,
 ) -> Tuple[List[str], List[Dict[str, Any]]]:
     # Always use aiohttp against the provided URL (default Netflix)
-    target = url or _DEFAULT_TARGET
+    target = url or DEFAULT_VALIDATION_URL
 
     def _noop_live(_p: str, _d: Dict[str, Any]) -> None:
         return
@@ -367,6 +377,12 @@ def check_proxies(
             on_live=_noop_live,
             on_result=None,
             user_agent=user_agent,
+            accept_language=accept_language,
+            ttfb_seconds=ttfb_seconds,
+            read_seconds=read_seconds,
+            min_bytes=min_bytes,
+            chunk_size=chunk_size,
+            progress_every=progress_every,
             total=total,
             stop_event=None,
             store_results=True,  # collect results for non-streaming API
@@ -384,10 +400,16 @@ def check_proxies_stream(
     on_result: Optional[OnResultFn] = None,
     verify_ssl: bool = True,  # kept for API compatibility
     user_agent: Optional[str] = None,
+    accept_language: str = "en-US,en;q=0.9",
+    ttfb_seconds: float = 2.0,
+    read_seconds: float = 2.5,
+    min_bytes: int = 1024,
+    chunk_size: int = 8192,
+    progress_every: float = 3.0,
     total: Optional[int] = None,
     stop_event: Optional[threading.Event] = None,
 ) -> Tuple[List[str], List[Dict[str, Any]]]:
-    target = url or _DEFAULT_TARGET
+    target = url or DEFAULT_VALIDATION_URL
     return asyncio.run(
         _run_stream_async(
             proxies=proxies,
@@ -397,6 +419,12 @@ def check_proxies_stream(
             on_live=on_live,
             on_result=on_result,
             user_agent=user_agent,
+            accept_language=accept_language,
+            ttfb_seconds=ttfb_seconds,
+            read_seconds=read_seconds,
+            min_bytes=min_bytes,
+            chunk_size=chunk_size,
+            progress_every=progress_every,
             total=total,
             stop_event=stop_event,
             store_results=False,  # avoid O(n) accumulation in streaming mode

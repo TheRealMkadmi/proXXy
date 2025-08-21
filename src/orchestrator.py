@@ -93,13 +93,13 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
             logger.info("scrape: starting (in-process, pluggable)")
             t0 = time.perf_counter()
             # Scraper runtime config from env (allows toggling SSL verification)
-            verify_ssl_env = os.environ.get("PROXXY_SCRAPER_VERIFY_SSL", "1").lower() not in ("0", "false", "no")
-            ua_env = os.environ.get("PROXXY_SCRAPER_UA", None)
+            verify_ssl_env = bool(getattr(cfg, "scraper_verify_ssl", True))
+            ua_env = getattr(cfg, "scraper_user_agent", None)
             try:
                 logger.debug("scrape.config: verify_ssl=%s ua=%s", verify_ssl_env, bool(ua_env))
             except Exception:
                 pass
-            enable_socks = os.environ.get("PROXXY_ENABLE_SOCKS", "1").strip().lower() not in ("0", "false", "no")
+            enable_socks = bool(getattr(cfg, "enable_socks", True))
             protocols = ("HTTP", "HTTPS") + (("SOCKS4", "SOCKS5") if enable_socks else ())
             scrapers = [
                 StaticUrlTextScraper(protocols=protocols, verify_ssl=verify_ssl_env),
@@ -192,7 +192,7 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
             # Flush to pool early so proxy can start once min_upstreams are available
             flush_threshold = max(1, int(getattr(cfg, "min_upstreams", 10)))
             last_flush_ts = time.monotonic()
-            progress_every = float(os.getenv("PROXXY_PROGRESS_EVERY", "3"))
+            progress_every = float(getattr(cfg, "progress_every", 3.0))
 
             def _flush_batch():
                 nonlocal batch, publish_size, published, last_flush_ts
@@ -278,7 +278,13 @@ def produce_process_loop(stop, config: Optional[OrchestratorConfig] = None, stat
                     on_live=_on_live,
                     on_result=_on_result,
                     verify_ssl=True,
-                    user_agent=None,
+                    user_agent=(getattr(cfg, "validator_user_agent", None) or getattr(cfg, "scraper_user_agent", None)),
+                    accept_language=str(getattr(cfg, "validator_accept_language", "en-US,en;q=0.9")),
+                    ttfb_seconds=float(getattr(cfg, "validator_ttfb_seconds", 2.0)),
+                    read_seconds=float(getattr(cfg, "validator_read_seconds", 2.5)),
+                    min_bytes=int(getattr(cfg, "validator_min_bytes", 1024)),
+                    chunk_size=int(getattr(cfg, "validator_chunk_size", 8192)),
+                    progress_every=float(getattr(cfg, "validator_progress_every", getattr(cfg, "progress_every", 3.0))),
                     total=candidates_count,
                     stop_event=stop,
                 )
@@ -322,6 +328,13 @@ def tunnel_proxy_server_loop(stop: threading.Event, config: Optional[Orchestrato
     - Emits lifecycle events to status_queue: proxy_starting, proxy_started, proxy_ready, proxy_exit
     """
     cfg = config or load_config_from_env()
+
+    # Align tunnel logger level with config
+    try:
+        lvl = str(getattr(cfg, "proxy_log_level", "WARNING")).upper()
+        logging.getLogger("proXXy.tunnel").setLevel(getattr(logging, lvl, logging.WARNING))
+    except Exception:
+        pass
 
     def emit(evt):
         if status_queue is None:
@@ -399,7 +412,29 @@ def tunnel_proxy_server_loop(stop: threading.Event, config: Optional[Orchestrato
                 emit({"type": "proxy_started", "attempt": int(attempt)})
 
             # Run the asyncio-based tunnel server in this thread until stop is set
-            run_tunnel_proxy(stop, host, port, pool_file, emit=emit)
+            run_tunnel_proxy(
+                stop,
+                host,
+                port,
+                pool_file,
+                emit=emit,
+                dial_timeout=float(getattr(cfg, "proxy_dial_timeout", 1.8)),
+                io_timeout=float(getattr(cfg, "proxy_read_timeout", 30.0)),
+                max_header_bytes=64 * 1024,
+                max_line_bytes=8192,
+                max_retries=int(getattr(cfg, "proxy_upstream_retries", 2)),
+                scan_max=int(getattr(cfg, "proxy_upstream_scan_max", 50)),
+                scan_budget=float(getattr(cfg, "proxy_upstream_scan_budget", 8.0)),
+                tunnel_idle_timeout=float(getattr(cfg, "proxy_tunnel_idle_timeout", 0.0)),
+                upstream_ssl_verify=bool(getattr(cfg, "proxy_upstream_ssl_verify", False)),
+                upstream_fanout=int(getattr(cfg, "proxy_upstream_fanout", 2)),
+                diag_on=bool(getattr(cfg, "proxy_tunnel_diag_on", False)),
+                diag_verbose=bool(getattr(cfg, "proxy_tunnel_diag_verbose", False)),
+                fail_log_every=int(getattr(cfg, "proxy_tunnel_fail_log_every", 1)),
+                early_close_max_a2b=int(getattr(cfg, "proxy_tunnel_early_close_max_a2b", 4096)),
+                early_close_max_b2a=int(getattr(cfg, "proxy_tunnel_early_close_max_b2a", 8192)),
+                early_close_max_ms=float(getattr(cfg, "proxy_tunnel_early_close_max_ms", 3000.0)),
+            )
             code = 0 if stop.is_set() else 1
         except Exception as e:
             logger.exception("proxy: tunnel server error (attempt %d): %s", attempt, e)

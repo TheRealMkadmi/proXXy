@@ -6,6 +6,7 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Dict, Tuple
+from collections import OrderedDict
 
 import asyncio
 import aiohttp
@@ -35,14 +36,13 @@ class LivePool:
     """
     Thread-safe in-memory pool of upstream proxies in canonical scheme://host:port form.
     Maintains insertion order and de-duplicates entries.
-    Supports TTL-based eviction via prune_expired(), and exposes oldest() for rechecks.
+    Exposes oldest()/latest() for rechecks. TTL-based eviction has been removed.
     """
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        self._list: List[str] = []
-        self._set = set()
-        # last_seen timestamps (epoch seconds)
-        self._meta: Dict[str, float] = {}
+        # Maintain proxies in insertion/recency order with O(1) move-to-end
+        # Mapping: proxy -> last_seen_ts
+        self._ord: "OrderedDict[str, float]" = OrderedDict()
 
     def add(self, proxy: str, now: Optional[float] = None) -> bool:
         p = _normalize_proxy(proxy)
@@ -50,18 +50,12 @@ class LivePool:
             return False
         ts = time.time() if now is None else float(now)
         with self._lock:
-            if p in self._set:
-                # Update last_seen and move to end to refresh recency
-                self._meta[p] = ts
-                try:
-                    self._list.remove(p)
-                    self._list.append(p)
-                except ValueError:
-                    self._list.append(p)
+            if p in self._ord:
+                # Refresh timestamp and recency
+                self._ord[p] = ts
+                self._ord.move_to_end(p, last=True)
                 return False
-            self._list.append(p)
-            self._set.add(p)
-            self._meta[p] = ts
+            self._ord[p] = ts
             return True
 
     def add_many(self, proxies: Iterable[str], now: Optional[float] = None) -> int:
@@ -72,17 +66,11 @@ class LivePool:
                 p = _normalize_proxy(proxy)
                 if not p:
                     continue
-                if p in self._set:
-                    self._meta[p] = ts
-                    try:
-                        self._list.remove(p)
-                        self._list.append(p)
-                    except ValueError:
-                        self._list.append(p)
+                if p in self._ord:
+                    self._ord[p] = ts
+                    self._ord.move_to_end(p, last=True)
                     continue
-                self._list.append(p)
-                self._set.add(p)
-                self._meta[p] = ts
+                self._ord[p] = ts
                 n += 1
         return n
 
@@ -91,29 +79,25 @@ class LivePool:
         if not p:
             return False
         with self._lock:
-            if p not in self._set:
+            if p not in self._ord:
                 return False
-            self._set.remove(p)
-            self._meta.pop(p, None)
             try:
-                self._list.remove(p)
-            except ValueError:
-                pass
+                self._ord.pop(p, None)
+            except Exception:
+                return False
             return True
 
     def clear(self) -> None:
         with self._lock:
-            self._list.clear()
-            self._set.clear()
-            self._meta.clear()
+            self._ord.clear()
 
     def snapshot(self) -> List[str]:
         with self._lock:
-            return list(self._list)
+            return list(self._ord.keys())
 
     def size(self) -> int:
         with self._lock:
-            return len(self._list)
+            return len(self._ord)
 
     def oldest(self, n: int) -> List[str]:
         """
@@ -121,9 +105,17 @@ class LivePool:
         """
         n = max(0, int(n))
         with self._lock:
-            if n == 0 or not self._list:
+            if n == 0 or not self._ord:
                 return []
-            return list(self._list[: min(n, len(self._list))])
+            k = min(n, len(self._ord))
+            out: List[str] = []
+            i = 0
+            for key in self._ord.keys():
+                out.append(key)
+                i += 1
+                if i >= k:
+                    break
+            return out
 
     def latest(self, n: int) -> List[str]:
         """
@@ -131,34 +123,19 @@ class LivePool:
         """
         n = max(0, int(n))
         with self._lock:
-            if n == 0 or not self._list:
+            if n == 0 or not self._ord:
                 return []
-            k = min(n, len(self._list))
-            return list(self._list[-k:])
+            k = min(n, len(self._ord))
+            # Efficient tail slice via reversed iterator
+            res = []
+            for idx, key in enumerate(reversed(self._ord.keys())):
+                if idx >= k:
+                    break
+                res.append(key)
+            res.reverse()
+            return res
 
-    def prune_expired(self, ttl_seconds: float, now: Optional[float] = None) -> int:
-        """
-        Remove entries whose last_seen is older than now - ttl_seconds.
-        Returns the number of removed entries.
-        """
-        if ttl_seconds <= 0:
-            return 0
-        ts_now = time.time() if now is None else float(now)
-        cutoff = ts_now - ttl_seconds
-        removed = 0
-        with self._lock:
-            survivors: List[str] = []
-            for p in self._list:
-                last_seen = self._meta.get(p, 0.0)
-                if last_seen >= cutoff:
-                    survivors.append(p)
-                else:
-                    self._set.discard(p)
-                    self._meta.pop(p, None)
-                    removed += 1
-            if removed:
-                self._list = survivors
-        return removed
+    # TTL-based prune method removed.
 
 
 class FileSyncWriter:
@@ -244,20 +221,28 @@ class FileSyncWriter:
 class PoolManagerConfig:
     file_path: str
     debounce_ms: int
-    ttl_seconds: int
     prune_interval_seconds: int
     health_check_url: Optional[str]
-    recheck_timeout: float = 3.0
+    # Recheck controls (centralized; no env lookups at runtime)
+    enable_recheck: bool = True
+    recheck_interval_seconds: float | int | None = None  # default to prune interval when None
+    recheck_order: str = "newest"  # "newest" | "oldest"
     recheck_per_interval: int = 25
     recheck_workers: int = 8
-    enable_recheck: bool = True
+    recheck_timeout: float = 3.0
+    recheck_connect_timeout: float = 1.8
+    recheck_min_bytes: int = 1024
+    recheck_read_seconds: float = 2.5
+    recheck_ttfb_seconds: float = 2.0
+    recheck_chunk_size: int = 8192
+    recheck_strikes_threshold: int = 2
 
 
 class PoolManager:
     """
     In-process pool manager:
-    - Maintains a LivePool of proxies (dedup, ordering, TTL refresh).
-    - Periodically prunes by TTL.
+    - Maintains a LivePool of proxies (dedup, ordering, refresh-by-recheck).
+    - Actively re-checks entries; TTL pruning removed.
     - Optionally re-checks a sample to remove dead proxies.
     - Mirrors the pool to a text file via atomic, debounced writes for consumption by the proxy server.
     """
@@ -271,13 +256,11 @@ class PoolManager:
         self._recheck_thread: Optional[threading.Thread] = None
         # Recheck strike tracking to avoid removing on single transient failure
         self._recheck_strikes: Dict[str, int] = {}
-        self._recheck_strike_threshold = int(os.getenv("PROXXY_POOL_RECHECK_STRIKES", "2"))
 
     # Lifecycle
     def start(self) -> None:
         logger.info(
-            "pool: start (ttl=%ss prune=%ss recheck=%s url=%s file=%s debounce=%sms size=%s)",
-            self.cfg.ttl_seconds,
+            "pool: start (prune=%ss recheck=%s url=%s file=%s debounce=%sms size=%s)",
             self.cfg.prune_interval_seconds,
             "on" if (self.cfg.enable_recheck and self.cfg.health_check_url) else "off",
             self.cfg.health_check_url or "-",
@@ -290,7 +273,7 @@ class PoolManager:
             self.file_sync.schedule()
         except Exception:
             pass
-        self._prune_thread.start()
+    # No TTL-based prune loop; reserved for future housekeeping if needed
         if self.cfg.enable_recheck and self.cfg.health_check_url:
             self._recheck_thread = threading.Thread(target=self._recheck_loop, name="pool-recheck", daemon=True)
             self._recheck_thread.start()
@@ -334,19 +317,11 @@ class PoolManager:
 
     # Background loops
     def _prune_loop(self) -> None:
-        last_log = time.monotonic()
+        # TTL pruning removed; keep method placeholder for potential future housekeeping
         while not self._stop_ev.wait(max(1, int(self.cfg.prune_interval_seconds))):
             try:
-                removed = self.pool.prune_expired(max(0, int(self.cfg.ttl_seconds)))
-                size = self.pool.size()
-                if removed > 0:
-                    self.file_sync.schedule()
-                now = time.monotonic()
-                if removed > 0 or (now - last_log) >= 60.0:
-                    logger.info("pool: pruned=%s size=%s ttl=%ss", removed, size, self.cfg.ttl_seconds)
-                    last_log = now
+                pass
             except Exception:
-                # Never crash pruning thread
                 pass
 
     async def _recheck_one_async(self, session: aiohttp.ClientSession, pxy: str, health_url: str) -> Tuple[str, bool]:
@@ -355,18 +330,18 @@ class PoolManager:
         - HTTP/HTTPS: reuse provided session with per-request proxy param.
         - SOCKS4/5: create a short-lived session using ProxyConnector for this proxy.
         """
-        # Tunables
-        min_bytes = int(os.getenv("PROXXY_POOL_RECHECK_MIN_BYTES", os.getenv("PROXXY_VALIDATOR_MIN_BYTES", "1024")))
-        read_window = float(os.getenv("PROXXY_POOL_RECHECK_READ_SECONDS", os.getenv("PROXXY_VALIDATOR_READ_SECONDS", "2.5")))
-        ttfb = float(os.getenv("PROXXY_POOL_RECHECK_TTFB_SECONDS", os.getenv("PROXXY_VALIDATOR_TTFB_SECONDS", "2.0")))
-        chunk_size = int(os.getenv("PROXXY_POOL_RECHECK_CHUNK_SIZE", os.getenv("PROXXY_VALIDATOR_CHUNK_SIZE", "8192")))
+        # Tunables (from config)
+        min_bytes = int(self.cfg.recheck_min_bytes)
+        read_window = float(self.cfg.recheck_read_seconds)
+        ttfb = float(self.cfg.recheck_ttfb_seconds)
+        chunk_size = int(self.cfg.recheck_chunk_size)
         # Choose path based on scheme
         sch = (pxy.split("://", 1)[0].lower() if "://" in pxy else "http")
         try:
             if sch in ("socks4", "socks5"):
                 # Build a dedicated session for this SOCKS proxy
-                timeout_total = float(os.getenv("PROXXY_POOL_RECHECK_TIMEOUT", "3.0"))
-                connect_to = float(os.getenv("PROXXY_POOL_RECHECK_CONNECT_TIMEOUT", "1.8"))
+                timeout_total = float(self.cfg.recheck_timeout)
+                connect_to = float(self.cfg.recheck_connect_timeout)
                 tmo = aiohttp.ClientTimeout(total=max(0.1, timeout_total), connect=min(connect_to, timeout_total))
                 connector2 = ProxyConnector.from_url(pxy, rdns=True)
                 async with aiohttp.ClientSession(timeout=tmo, connector=connector2, trust_env=False) as sess2:
@@ -417,66 +392,97 @@ class PoolManager:
         health_url = self.cfg.health_check_url
         if not isinstance(health_url, str) or not health_url:
             return
-        interval = float(os.getenv("PROXXY_POOL_RECHECK_INTERVAL_SECONDS", str(self.cfg.prune_interval_seconds)))
-        while not self._stop_ev.wait(max(0.2, interval)):
-            try:
-                order = (os.getenv("PROXXY_POOL_RECHECK_ORDER", "newest") or "newest").strip().lower()
-                count = int(self.cfg.recheck_per_interval)
-                if order == "newest":
-                    sample = self.pool.latest(count)
-                else:
-                    sample = self.pool.oldest(count)
-                if not sample:
-                    continue
+        interval_cfg = self.cfg.recheck_interval_seconds
+        interval = float(self.cfg.prune_interval_seconds if (interval_cfg is None) else interval_cfg)
+        # Persistent event loop and HTTP session to improve throughput
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+        except Exception:
+            pass
+        timeout_total = float(self.cfg.recheck_timeout)
+        connect_to = float(self.cfg.recheck_connect_timeout)
+        tmo = aiohttp.ClientTimeout(total=max(0.1, timeout_total), connect=min(connect_to, timeout_total))
+        headers = {
+            "Accept": "*/*",
+            "Connection": "keep-alive",
+        }
 
-                async def _run_batch() -> Dict[str, bool]:
-                    timeout_total = float(os.getenv("PROXXY_POOL_RECHECK_TIMEOUT", str(self.cfg.recheck_timeout)))
-                    connect_to = float(os.getenv("PROXXY_POOL_RECHECK_CONNECT_TIMEOUT", "1.8"))
-                    tmo = aiohttp.ClientTimeout(total=max(0.1, timeout_total), connect=min(connect_to, timeout_total))
-                    headers = {
-                        "Accept": "*/*",
-                        "Connection": "keep-alive",
-                    }
-                    sem = asyncio.Semaphore(max(1, int(self.cfg.recheck_workers)))
-                    results: Dict[str, bool] = {}
+        async def _make_session():
+            return aiohttp.ClientSession(timeout=tmo, headers=headers, trust_env=False)
 
-                    async with aiohttp.ClientSession(timeout=tmo, headers=headers, trust_env=False) as session:
+        session = loop.run_until_complete(_make_session())
+        try:
+            while not self._stop_ev.wait(max(0.2, interval)):
+                try:
+                    order = (self.cfg.recheck_order or "newest").strip().lower()
+                    count = int(self.cfg.recheck_per_interval)
+                    sample = self.pool.latest(count) if order == "newest" else self.pool.oldest(count)
+                    if not sample:
+                        continue
+
+                    async def _run_batch(sess: aiohttp.ClientSession, items: List[str]) -> Dict[str, bool]:
+                        sem = asyncio.Semaphore(max(1, int(self.cfg.recheck_workers)))
+                        results: Dict[str, bool] = {}
+
                         async def one(p: str):
                             async with sem:
-                                px, ok = await self._recheck_one_async(session, p, health_url)
+                                px, ok = await self._recheck_one_async(sess, p, health_url)
                                 results[px] = ok
 
-                        tasks = [asyncio.create_task(one(p)) for p in sample]
+                        tasks = [asyncio.create_task(one(p)) for p in items]
                         if tasks:
                             await asyncio.gather(*tasks, return_exceptions=True)
-                    return results
+                        return results
 
-                outcome = asyncio.run(_run_batch())
-                removed = 0
-                ok_count = 0
-                for pxy, ok in outcome.items():
-                    if ok:
-                        ok_count += 1
-                        try:
-                            self._recheck_strikes.pop(pxy, None)
-                        except Exception:
-                            pass
-                    else:
-                        cnt = int(self._recheck_strikes.get(pxy, 0)) + 1
-                        self._recheck_strikes[pxy] = cnt
-                        if cnt >= int(self._recheck_strike_threshold):
-                            if self.pool.remove(pxy):
-                                removed += 1
+                    outcome = loop.run_until_complete(_run_batch(session, sample))
+                    removed = 0
+                    ok_count = 0
+                    for pxy, ok in outcome.items():
+                        if ok:
+                            ok_count += 1
                             try:
                                 self._recheck_strikes.pop(pxy, None)
                             except Exception:
                                 pass
-                if removed:
-                    self.file_sync.schedule()
-                if removed or ok_count:
-                    logger.info("pool: recheck url=%s ok=%s removed=%s size=%s", health_url, ok_count, removed, self.pool.size())
+                        else:
+                            cnt = int(self._recheck_strikes.get(pxy, 0)) + 1
+                            self._recheck_strikes[pxy] = cnt
+                            if cnt >= int(self.cfg.recheck_strikes_threshold):
+                                if self.pool.remove(pxy):
+                                    removed += 1
+                                try:
+                                    self._recheck_strikes.pop(pxy, None)
+                                except Exception:
+                                    pass
+                    if removed:
+                        self.file_sync.schedule()
+                    if removed or ok_count:
+                        logger.info("pool: recheck url=%s ok=%s removed=%s size=%s", health_url, ok_count, removed, self.pool.size())
+                except Exception:
+                    # Never crash recheck thread
+                    pass
+        finally:
+            try:
+                loop.run_until_complete(session.close())
             except Exception:
-                # Never crash recheck thread
+                pass
+            try:
+                pending = asyncio.all_tasks(loop)
+            except Exception:
+                pending = set()
+            for t in pending:
+                try:
+                    t.cancel()
+                except Exception:
+                    pass
+            try:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            except Exception:
+                pass
+            try:
+                loop.close()
+            except Exception:
                 pass
 
 

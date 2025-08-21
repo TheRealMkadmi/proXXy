@@ -24,15 +24,13 @@ if not logger.handlers:
         format="%(asctime)s [%(levelname)s] %(processName)s(%(process)d)/%(threadName)s: %(message)s",
     )
 
-# Diagnostics controls
-_DIAG_STR = os.getenv("PROXXY_TUNNEL_DIAG", "off").strip().lower()
-_DIAG_ON = _DIAG_STR not in ("0", "off", "false", "no")
-_DIAG_VERBOSE = _DIAG_STR in ("verbose", "v", "debug")
-_FAIL_LOG_EVERY = max(1, int(os.getenv("PROXXY_TUNNEL_FAIL_LOG_EVERY", "1")))
-# Early-close classification thresholds (used to mark target-scoped backoff after short tunnels)
-_EARLY_CLOSE_MAX_A2B = int(os.getenv("PROXXY_TUNNEL_EARLY_CLOSE_MAX_A2B", "4096"))
-_EARLY_CLOSE_MAX_B2A = int(os.getenv("PROXXY_TUNNEL_EARLY_CLOSE_MAX_B2A", "8192"))
-_EARLY_CLOSE_MAX_MS = float(os.getenv("PROXXY_TUNNEL_EARLY_CLOSE_MAX_MS", "3000"))
+# Diagnostics controls (centralized via constructor)
+_DIAG_ON = False
+_DIAG_VERBOSE = False
+_FAIL_LOG_EVERY = 1
+_EARLY_CLOSE_MAX_A2B = 4096
+_EARLY_CLOSE_MAX_B2A = 8192
+_EARLY_CLOSE_MAX_MS = 3000.0
 
 def _new_cid() -> str:
     try:
@@ -182,33 +180,47 @@ class TunnelProxyServer:
         max_header_bytes: int = 64 * 1024,
         max_line_bytes: int = 8192,
         max_retries: int = 2,
+        scan_max: int = 50,
+        scan_budget: float = 8.0,
+        tunnel_idle_timeout: float = 0.0,
+        upstream_ssl_verify: bool = False,
+        upstream_fanout: int = 2,
+        diag_on: bool = False,
+        diag_verbose: bool = False,
+        fail_log_every: int = 1,
+        early_close_max_a2b: int = 4096,
+        early_close_max_b2a: int = 8192,
+        early_close_max_ms: float = 3000.0,
     ) -> None:
         self.host = host
         self.port = int(port)
         self.emit = emit
         self.pool = PoolFileUpstreams(pool_file)
-        self.dial_timeout = float(os.getenv("PROXXY_PROXY_DIAL_TIMEOUT", str(dial_timeout)))
-        self.io_timeout = float(os.getenv("PROXXY_PROXY_READ_TIMEOUT", str(io_timeout)))
+        self.dial_timeout = float(dial_timeout)
+        self.io_timeout = float(io_timeout)
         self.max_header_bytes = int(max_header_bytes)
         self.max_line_bytes = int(max_line_bytes)
-        self.max_retries = max(0, int(os.getenv("PROXXY_PROXY_UPSTREAM_RETRIES", str(max_retries))))
-        self._server: Optional[asyncio.AbstractServer] = None
-        # Failure backoff cache for upstream selection (skip recently failed endpoints)
-        # Default disabled (0) to avoid any cross-request stickiness
-        self.failure_ttl = float(os.getenv("PROXXY_PROXY_UPSTREAM_FAILURE_TTL", "0"))
-        # Key: (scheme, host, port, username, password)
-        self._failures: Dict[Tuple[str, str, int, str, str], float] = {}
-        # Target-scoped failure TTL (default to upstream TTL)
-        self.target_failure_ttl = float(os.getenv("PROXXY_PROXY_TARGET_FAILURE_TTL", os.getenv("PROXXY_PROXY_UPSTREAM_FAILURE_TTL", "0")))
-        # Key: (target, scheme, host, port, username, password)
-        self._failures_by_target: Dict[Tuple[str, str, str, int, str, str], float] = {}
+        self.max_retries = max(0, int(max_retries))
+        self._server = None
+    # Failure backoff removed: we always consider current pool snapshot
         # Candidate scan controls per client request
-        self.scan_max = int(os.getenv("PROXXY_PROXY_UPSTREAM_SCAN_MAX", "50"))
-        self.scan_budget = float(os.getenv("PROXXY_PROXY_UPSTREAM_SCAN_BUDGET", "8.0"))
+        self.scan_max = int(scan_max)
+        self.scan_budget = float(scan_budget)
         # Dedicated idle timeout for CONNECT tunnels; 0 = no idle timeout (recommended for H2)
-        self.tunnel_idle_timeout = float(os.getenv("PROXXY_PROXY_TUNNEL_IDLE_TIMEOUT", "0"))
+        self.tunnel_idle_timeout = float(tunnel_idle_timeout)
+        # Upstream connection preferences
+        self.upstream_ssl_verify = bool(upstream_ssl_verify)
+        self.upstream_fanout = max(1, int(upstream_fanout))
         # Track active client handler tasks for graceful shutdown
-        self._client_tasks: Set[asyncio.Task] = set()
+        self._client_tasks = set()
+        # Diagnostics
+        global _DIAG_ON, _DIAG_VERBOSE, _FAIL_LOG_EVERY, _EARLY_CLOSE_MAX_A2B, _EARLY_CLOSE_MAX_B2A, _EARLY_CLOSE_MAX_MS
+        _DIAG_ON = bool(diag_on)
+        _DIAG_VERBOSE = bool(diag_verbose)
+        _FAIL_LOG_EVERY = max(1, int(fail_log_every))
+        _EARLY_CLOSE_MAX_A2B = int(early_close_max_a2b)
+        _EARLY_CLOSE_MAX_B2A = int(early_close_max_b2a)
+        _EARLY_CLOSE_MAX_MS = float(early_close_max_ms)
 
     async def start(self) -> None:
         self._server = await asyncio.start_server(self._handle_client, self.host, self.port, start_serving=True)
@@ -370,20 +382,17 @@ class TunnelProxyServer:
         sticky: Optional[UpstreamProxy] = None,
         cid: Optional[str] = None,
     ) -> None:
-        # Parse host:port
         host, port = self._split_host_port(target)
         if not host or port is None:
             if _DIAG_ON:
                 logger.info("tunnel[%s]: reject reason=bad_connect_target target=%r", cid, target)
             await self._respond(client_w, 400, "Bad CONNECT Target")
             return
-    
+
         attempts = self.max_retries + 1
         last_err: Optional[str] = None
-        # Build candidate list: prefer sticky, then extras to honor retries
         _cand: List[UpstreamProxy] = [sticky] if sticky else []
         _extras = self.pool.next_many(max(attempts, min(self.pool.size(), int(getattr(self, "scan_max", 20)))))
-        # Deduplicate by endpoint + credentials
         _seen_keys = set()
         candidates: List[UpstreamProxy] = []
         for up in (_cand + _extras):
@@ -394,56 +403,29 @@ class TunnelProxyServer:
                 continue
             _seen_keys.add(_key)
             candidates.append(up)
-        # Skip recently failed upstreams within TTL window (only if TTL > 0)
+
         skipped_ttl = 0
-        if self.failure_ttl > 0:
-            now_ts = time.monotonic()
-            filtered: List[UpstreamProxy] = []
-            for up in candidates:
-                _key = (up.scheme, up.host, up.port, up.username or "", up.password or "")
-                ts = self._failures.get(_key, 0.0)
-                if ts and (now_ts - ts) < self.failure_ttl:
-                    skipped_ttl += 1
-                    continue
-                filtered.append(up)
-            if filtered:
-                candidates = filtered
-        # Target-scoped backoff
         skipped_target = 0
         target_label = f"{host}:{port}"
-        if self.target_failure_ttl > 0:
-            now_ts = time.monotonic()
-            filtered2: List[UpstreamProxy] = []
-            for up in candidates:
-                _key_t = (target_label, up.scheme, up.host, up.port, up.username or "", up.password or "")
-                ts = self._failures_by_target.get(_key_t, 0.0)
-                if ts and (now_ts - ts) < self.target_failure_ttl:
-                    skipped_target += 1
-                    continue
-                filtered2.append(up)
-            if filtered2:
-                candidates = filtered2
         budget = float(getattr(self, "scan_budget", 8.0))
         budget_deadline = time.monotonic() + max(0.0, budget)
-        fanout = max(1, int(os.getenv("PROXXY_PROXY_UPSTREAM_FANOUT", "2")))
+        fanout = max(1, int(getattr(self, "upstream_fanout", 2)))
         idx = 0
-    
+
         if _DIAG_ON:
             try:
                 logger.info(
-                    "tunnel[%s]: connect target=%s:%s candidates=%d skipped_ttl=%d skipped_target=%d fanout=%d budget_s=%.2f ttl=%.1f",
-                    cid, host, port, len(candidates), skipped_ttl, skipped_target, fanout, budget, self.failure_ttl
+                    "tunnel[%s]: connect target=%s:%s candidates=%d skipped_ttl=%d skipped_target=%d fanout=%d budget_s=%.2f",
+                    cid, host, port, len(candidates), skipped_ttl, skipped_target, fanout, budget
                 )
             except Exception:
                 pass
-    
+
         async def _try_connect(up: UpstreamProxy):
-            # Return (ok, up_r, up_w, err, up). Supports HTTP(S) upstream proxies and SOCKS4/5.
             dial_ms = 0.0
             try:
                 t0 = time.monotonic()
                 if up.scheme in ("socks4", "socks5"):
-                    # Establish tunnel to target via SOCKS immediately (no HTTP CONNECT handshake to upstream)
                     up_r, up_w = await asyncio.wait_for(self._open_socks_tunnel(up, host, int(port)), timeout=self.io_timeout)
                     dial_ms = (time.monotonic() - t0) * 1000.0
                     if _DIAG_ON:
@@ -463,7 +445,6 @@ class TunnelProxyServer:
                     )
                 return False, None, None, f"connect-upstream-failed {e}", up
 
-            # HTTP/HTTPS upstream: send CONNECT
             try:
                 lines = [
                     f"CONNECT {host}:{port} HTTP/1.1",
@@ -476,7 +457,6 @@ class TunnelProxyServer:
                 up_w.write(data)
                 await asyncio.wait_for(up_w.drain(), timeout=self.io_timeout)
 
-                # Read upstream response
                 t1 = time.monotonic()
                 status_line = await asyncio.wait_for(up_r.readline(), timeout=self.io_timeout)
                 if not status_line:
@@ -496,7 +476,6 @@ class TunnelProxyServer:
                     return False, None, None, "empty-response", up
                 status = status_line.decode("latin1", "replace").strip()
                 code = self._parse_status_code(status)
-                # Drain headers
                 while True:
                     line = await asyncio.wait_for(up_r.readline(), timeout=self.io_timeout)
                     if not line or line in (b"\r\n", b"\n"):
@@ -539,7 +518,7 @@ class TunnelProxyServer:
                         cid, up.scheme, up.host, up.port, bool(up.username), e, dial_ms
                     )
                 return False, None, None, f"upstream-error {e}", up
-    
+
         while idx < len(candidates):
             if time.monotonic() > budget_deadline:
                 break
@@ -549,8 +528,7 @@ class TunnelProxyServer:
                 break
             tasks = [asyncio.create_task(_try_connect(up)) for up in batch]
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-    
-            # Check if any succeeded
+
             success_tuple = None
             for fut in done:
                 ok, up_r, up_w, err, up = fut.result()
@@ -559,11 +537,8 @@ class TunnelProxyServer:
                     break
                 else:
                     last_err = err
-                    self._mark_fail(up)
-                    self._mark_fail_for_target(target_label, up)
-    
+
             if success_tuple is not None:
-                # Cancel remaining attempts
                 for t in pending:
                     try:
                         t.cancel()
@@ -574,10 +549,8 @@ class TunnelProxyServer:
                         await asyncio.gather(*pending, return_exceptions=True)
                     except Exception:
                         pass
-                # Inform client and start piping
                 up_r, up_w, up = success_tuple
                 if up_r is None or up_w is None:
-                    # Defensive: should not happen since success_tuple implies non-None
                     last_err = "internal-error: upstream streams absent"
                     try:
                         if up_w is not None:
@@ -589,8 +562,6 @@ class TunnelProxyServer:
                     except Exception:
                         pass
                     continue
-                self._clear_fail(up)
-                self._clear_fail_for_target(target_label, up)
                 await self._respond_raw(client_w, b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 if _DIAG_ON:
                     logger.info(
@@ -612,21 +583,18 @@ class TunnelProxyServer:
                 )
                 dur_ms = (time.monotonic() - t_pipe0) * 1000.0
                 early_close = (dur_ms <= _EARLY_CLOSE_MAX_MS and a2b <= _EARLY_CLOSE_MAX_A2B and b2a <= _EARLY_CLOSE_MAX_B2A) and (end_a != "timeout" and end_b != "timeout")
-                if early_close:
-                    self._mark_fail_for_target(target_label, up)
-                    if _DIAG_ON:
-                        logger.info(
-                            "tunnel[%s]: early_close target=%s via=%s://%s:%s a2b=%d b2a=%d dur_ms=%.0f",
-                            cid, target_label, up.scheme, up.host, up.port, a2b, b2a, dur_ms
-                        )
+                if early_close and _DIAG_ON:
+                    logger.info(
+                        "tunnel[%s]: early_close target=%s via=%s://%s:%s a2b=%d b2a=%d dur_ms=%.0f",
+                        cid, target_label, up.scheme, up.host, up.port, a2b, b2a, dur_ms
+                    )
                 if _DIAG_ON:
                     logger.info(
                         "tunnel[%s]: CONNECT closed target=%s:%s via=%s://%s:%s dur_ms=%.0f",
                         cid, host, port, up.scheme, up.host, up.port, dur_ms
                     )
                 return
-    
-            # No success in this batch; cancel any still-pending and continue
+
             for t in pending:
                 try:
                     t.cancel()
@@ -637,9 +605,7 @@ class TunnelProxyServer:
                     await asyncio.gather(*pending, return_exceptions=True)
                 except Exception:
                     pass
-            # continue to next batch
-    
-        # No upstream succeeded
+
         logger.warning("tunnel[%s]: CONNECT failed target=%s:%s err=%s", cid, host, port, last_err)
         await self._respond(client_w, 502, "Bad Gateway")
 
@@ -655,7 +621,6 @@ class TunnelProxyServer:
         sticky: Optional[UpstreamProxy] = None,
         cid: Optional[str] = None,
     ) -> None:
-        # Ensure absolute-form URI for upstream HTTP proxy
         if target.startswith("http://") or target.startswith("https://"):
             abs_uri = target
         else:
@@ -665,10 +630,8 @@ class TunnelProxyServer:
                     logger.info("tunnel[%s]: reject reason=missing_host", cid)
                 await self._respond(client_w, 400, "Missing Host")
                 return
-            # Default to http schema for origin-form
             abs_uri = f"http://{host}{target}"
 
-        # For diagnostics: extract authority/scheme (path redacted implicitly)
         try:
             u = urlsplit(abs_uri)
             authority = u.netloc
@@ -681,10 +644,8 @@ class TunnelProxyServer:
 
         attempts = self.max_retries + 1
         last_err: Optional[str] = None
-        # Build candidate list: prefer sticky, then extras to honor retries
         _cand: List[UpstreamProxy] = [sticky] if sticky else []
         _extras = self.pool.next_many(max(attempts, min(self.pool.size(), int(getattr(self, "scan_max", 20)))))
-        # Deduplicate by endpoint + credentials
         _seen_keys = set()
         candidates: List[UpstreamProxy] = []
         for up in (_cand + _extras):
@@ -695,42 +656,17 @@ class TunnelProxyServer:
                 continue
             _seen_keys.add(_key)
             candidates.append(up)
-        # Skip recently failed upstreams within TTL window (only if TTL > 0)
+
         budget = float(getattr(self, "scan_budget", 8.0))
         budget_deadline = time.monotonic() + max(0.0, budget)
         skipped_ttl = 0
-        if self.failure_ttl > 0:
-            now_ts = time.monotonic()
-            filtered: List[UpstreamProxy] = []
-            for up in candidates:
-                _key = (up.scheme, up.host, up.port, up.username or "", up.password or "")
-                ts = self._failures.get(_key, 0.0)
-                if ts and (now_ts - ts) < self.failure_ttl:
-                    skipped_ttl += 1
-                    continue
-                filtered.append(up)
-            if filtered:
-                candidates = filtered
-        # Target-scoped backoff for HTTP
         skipped_target = 0
-        target_label = authority
-        if self.target_failure_ttl > 0:
-            now_ts = time.monotonic()
-            filtered2: List[UpstreamProxy] = []
-            for up in candidates:
-                _key_t = (target_label, up.scheme, up.host, up.port, up.username or "", up.password or "")
-                ts = self._failures_by_target.get(_key_t, 0.0)
-                if ts and (now_ts - ts) < self.target_failure_ttl:
-                    skipped_target += 1
-                    continue
-                filtered2.append(up)
-            if filtered2:
-                candidates = filtered2
         if _DIAG_ON:
             logger.info(
                 "tunnel[%s]: http candidates=%d skipped_ttl=%d skipped_target=%d budget_s=%.2f",
                 cid, len(candidates), skipped_ttl, skipped_target, budget
             )
+
         for up in candidates:
             if time.monotonic() > budget_deadline:
                 break
@@ -741,8 +677,6 @@ class TunnelProxyServer:
                     dial_ms = (time.monotonic() - t0) * 1000.0
                 except Exception as e:
                     last_err = f"connect-upstream-failed {e}"
-                    self._mark_fail(up)
-                    self._mark_fail_for_target(target_label, up)
                     if _DIAG_ON:
                         logger.info(
                             "tunnel[%s]: http attempt fail phase=dial upstream=%s://%s:%s auth=%s err=%s",
@@ -750,9 +684,7 @@ class TunnelProxyServer:
                         )
                     continue
                 try:
-                    # Build request to upstream (speak HTTP/1.1 to upstream proxy)
                     out_lines: List[str] = [f"{method} {abs_uri} HTTP/1.1"]
-                    # Rewrite headers: drop client Proxy-* headers and Connection, add our Proxy-Authorization if needed
                     for h in raw_headers:
                         if not h or ":" not in h:
                             continue
@@ -774,9 +706,6 @@ class TunnelProxyServer:
                             "tunnel[%s]: http forward start upstream=%s://%s:%s auth=%s dial_ms=%.0f",
                             cid, up.scheme, up.host, up.port, bool(up.username), dial_ms
                         )
-                    # After sending headers, relay bidirectionally (this supports bodies and simple keep-alive)
-                    self._clear_fail(up)
-                    self._clear_fail_for_target(target_label, up)
                     t_pipe0 = time.monotonic()
                     await self._pipe_bidirectional(
                         client_r,
@@ -795,7 +724,6 @@ class TunnelProxyServer:
                     return
                 except Exception as e:
                     last_err = f"upstream-error {e}"
-                    self._mark_fail(up)
                     try:
                         up_w.close()
                         try:
@@ -811,7 +739,6 @@ class TunnelProxyServer:
                         )
                     continue
             else:
-                # SOCKS upstream: connect to origin via SOCKS and forward origin-form request (HTTP only)
                 try:
                     try:
                         u2 = urlsplit(abs_uri)
@@ -825,7 +752,6 @@ class TunnelProxyServer:
                         dst_port = 80
                         path = "/"
                     if scheme == "https":
-                        # For HTTPS targets use CONNECT; non-CONNECT HTTPS is not supported over SOCKS forward
                         last_err = "https-over-socks-forward-unsupported"
                         if _DIAG_ON:
                             logger.info("tunnel[%s]: reject http-forward over socks to https authority=%s", cid, authority)
@@ -852,8 +778,6 @@ class TunnelProxyServer:
                             "tunnel[%s]: http forward start via socks upstream=%s://%s:%s dial_ms=%.0f",
                             cid, up.scheme, up.host, up.port, dial_ms
                         )
-                    self._clear_fail(up)
-                    self._clear_fail_for_target(target_label, up)
                     t_pipe0 = time.monotonic()
                     await self._pipe_bidirectional(
                         client_r,
@@ -872,7 +796,6 @@ class TunnelProxyServer:
                     return
                 except Exception as e:
                     last_err = f"socks-forward-error {e}"
-                    self._mark_fail(up)
                     if _DIAG_ON:
                         logger.info(
                             "tunnel[%s]: http attempt fail via socks upstream=%s://%s:%s err=%s",
@@ -1019,7 +942,7 @@ class TunnelProxyServer:
             ssl_ctx = ssl.create_default_context()
             # Optional TLS verification against upstream proxies (default off)
             try:
-                verify_up = os.getenv("PROXXY_PROXY_UPSTREAM_SSL_VERIFY", "0").strip().lower() not in ("0", "false", "no", "off")
+                verify_up = bool(getattr(self, "upstream_ssl_verify", False))
                 if not verify_up:
                     ssl_ctx.check_hostname = False
                     ssl_ctx.verify_mode = ssl.CERT_NONE
@@ -1155,48 +1078,6 @@ class TunnelProxyServer:
             pass
         return 0
 
-    def _mark_fail(self, up: UpstreamProxy) -> None:
-        if self.failure_ttl <= 0:
-            return
-        try:
-            key = (up.scheme, up.host, up.port, up.username or "", up.password or "")
-            self._failures[key] = time.monotonic()
-        except Exception:
-            pass
-
-    def _clear_fail(self, up: UpstreamProxy) -> None:
-        if self.failure_ttl <= 0:
-            return
-        try:
-            key = (up.scheme, up.host, up.port, up.username or "", up.password or "")
-            self._failures.pop(key, None)
-        except Exception:
-            pass
-
-    def _mark_fail_for_target(self, target_label: str, up: UpstreamProxy) -> None:
-        """
-        Record a failure for a specific target (host:port or authority) and upstream endpoint.
-        Used to temporarily back off this upstream when contacting the same target again.
-        """
-        if self.target_failure_ttl <= 0:
-            return
-        try:
-            key_t = (target_label, up.scheme, up.host, up.port, up.username or "", up.password or "")
-            self._failures_by_target[key_t] = time.monotonic()
-        except Exception:
-            pass
-
-    def _clear_fail_for_target(self, target_label: str, up: UpstreamProxy) -> None:
-        """
-        Clear a previously recorded target-scoped failure for this upstream endpoint.
-        """
-        if self.target_failure_ttl <= 0:
-            return
-        try:
-            key_t = (target_label, up.scheme, up.host, up.port, up.username or "", up.password or "")
-            self._failures_by_target.pop(key_t, None)
-        except Exception:
-            pass
 
 
 
@@ -1206,6 +1087,22 @@ def run_tunnel_proxy(
     port: int,
     pool_file: str,
     emit: Optional[Callable[[dict], None]] = None,
+    dial_timeout: float = 3.0,
+    io_timeout: float = 30.0,
+    max_header_bytes: int = 64 * 1024,
+    max_line_bytes: int = 8192,
+    max_retries: int = 2,
+    scan_max: int = 50,
+    scan_budget: float = 8.0,
+    tunnel_idle_timeout: float = 0.0,
+    upstream_ssl_verify: bool = False,
+    upstream_fanout: int = 2,
+    diag_on: bool = False,
+    diag_verbose: bool = False,
+    fail_log_every: int = 1,
+    early_close_max_a2b: int = 4096,
+    early_close_max_b2a: int = 8192,
+    early_close_max_ms: float = 3000.0,
 ) -> None:
     """
     Blocking entry-point: runs an asyncio server until stop_event is set.
@@ -1213,7 +1110,28 @@ def run_tunnel_proxy(
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    server = TunnelProxyServer(host=host, port=port, pool_file=pool_file, emit=emit)
+    server = TunnelProxyServer(
+        host=host,
+        port=port,
+        pool_file=pool_file,
+        emit=emit,
+        dial_timeout=dial_timeout,
+        io_timeout=io_timeout,
+        max_header_bytes=max_header_bytes,
+        max_line_bytes=max_line_bytes,
+    max_retries=max_retries,
+        scan_max=scan_max,
+        scan_budget=scan_budget,
+        tunnel_idle_timeout=tunnel_idle_timeout,
+        upstream_ssl_verify=upstream_ssl_verify,
+        upstream_fanout=upstream_fanout,
+    diag_on=diag_on,
+    diag_verbose=diag_verbose,
+    fail_log_every=fail_log_every,
+    early_close_max_a2b=early_close_max_a2b,
+    early_close_max_b2a=early_close_max_b2a,
+    early_close_max_ms=early_close_max_ms,
+    )
 
     async def _main():
         await server.serve_until(stop_event)

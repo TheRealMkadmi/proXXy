@@ -11,7 +11,7 @@ Quick links: [main()](src/main.py:59) · [produce_process_loop()](src/orchestrat
 - Async validators with bounded worker pool and backpressure
 - File-backed pool with atomic, debounced writes for the proxy server
 - Tunneling-only HTTP proxy (CONNECT and HTTP), no TLS interception
-- Failure-aware upstream selection (retry, fanout, TTL backoff, target-scoped backoff)
+- Failure-aware upstream selection (retry, fanout, parallel scan budget)
 - Simple, colorized status ticker
 
 ---
@@ -50,7 +50,7 @@ The CLI only sets environment variables; precedence is CLI > env > defaults. All
 - --status-interval → PROXXY_STATUS_INTERVAL_SECONDS (default: 5)
 - --pool-file → PROXXY_POOL_FILE (default: ./proxies.txt)
 - --pool-debounce-ms → PROXXY_POOL_DEBOUNCE_MS (default: 150)
-- --pool-ttl-seconds → PROXXY_POOL_TTL_SECONDS (default: 900)
+  (pool TTL removed; pool entries persist as long as they keep passing checks)
 - --pool-prune-interval-seconds → PROXXY_POOL_PRUNE_INTERVAL_SECONDS (default: 30)
 - --min-upstreams → PROXXY_MIN_UPSTREAMS (default: 10)
 - --scraper-log-level → PROXXY_SCRAPER_LOG_LEVEL (for scraper logging)
@@ -70,7 +70,7 @@ Pipeline:
 Proxy server (defaults set in [main()](src/main.py:85)):
 - PROXXY_PROXY_UPSTREAM_RETRIES=6
 - PROXXY_PROXY_DIAL_TIMEOUT=1.8
-- PROXXY_PROXY_UPSTREAM_FAILURE_TTL=60
+  (failure TTL/backoff removed; upstream selection uses retries + fanout)
 - PROXXY_PROXY_UPSTREAM_FANOUT=3
 
 Listener:
@@ -84,9 +84,9 @@ Status:
 Pool (file-backed) and maintenance:
 - PROXXY_POOL_FILE="./proxies.txt"
 - PROXXY_POOL_DEBOUNCE_MS=150
-- PROXXY_POOL_TTL_SECONDS=900
+  (pool TTL removed)
 - PROXXY_POOL_PRUNE_INTERVAL_SECONDS=30
-- Recheck loop toggles (sample): PROXXY_POOL_RECHECK_STRIKES, PROXXY_POOL_RECHECK_INTERVAL_SECONDS, PROXXY_POOL_RECHECK_ORDER, PROXXY_POOL_RECHECK_TIMEOUT, PROXXY_POOL_RECHECK_CONNECT_TIMEOUT
+ - Recheck loop is centrally configured in code (no env toggles). See `PoolManagerConfig` in `src/pool_manager.py` for defaults.
 
 Scrapers:
 - PROXXY_SCRAPER_VERIFY_SSL=1
@@ -121,11 +121,11 @@ Proxy server tuning (see [TunnelProxyServer.__init__](src/proxy_server.py:173)):
 - Pool manager: [PoolManager](src/pool_manager.py:255)  
   - In-memory pool: [LivePool](src/pool_manager.py:33) with recency metadata
   - File mirror: [FileSyncWriter](src/pool_manager.py:163) (atomic, debounced)
-  - TTL prune: [PoolManager._prune_loop()](src/pool_manager.py:335)
+  - Pool maintenance: active rechecks, no TTL pruning
   - Optional health recheck: [PoolManager._recheck_loop()](src/pool_manager.py:380)
   - Ingest mp.Queue: [pool_ingest_loop()](src/pool_manager.py:448)
 - Proxy server (tunnel only): [TunnelProxyServer](src/proxy_server.py:164) via [run_tunnel_proxy()](src/proxy_server.py:1026)  
-  - CONNECT path: [_handle_connect()](src/proxy_server.py:364) with retry/fanout/budget and TTL backoff
+  - CONNECT path: [_handle_connect()](src/proxy_server.py) with retry/fanout/budget
   - HTTP path: [_handle_http()](src/proxy_server.py:633) with minimal header rewrite
   - Bidirectional pipe: [_pipe_bidirectional()](src/proxy_server.py:803)
   - Upstream pool reader: [PoolFileUpstreams](src/proxy_server.py:87)
@@ -160,7 +160,7 @@ Source configuration:
 
 - Stuck “waiting for upstreams”: ensure scrapers reach sources (network/DNS), or lower PROXXY_MIN_UPSTREAMS.
 - Slow proxying: increase pool size or adjust PROXXY_PROXY_UPSTREAM_FANOUT and PROXXY_PROXY_UPSTREAM_RETRIES.
-- Frequent early closes: increase PROXXY_PROXY_TARGET_FAILURE_TTL or tune early-close thresholds.
+- Frequent early closes: consider adjusting early-close thresholds in the proxy server configuration.
 - Validator too aggressive: raise PROXXY_VALIDATOR_MIN_BYTES or READ_SECONDS, or increase timeout/workers.
 
 ---

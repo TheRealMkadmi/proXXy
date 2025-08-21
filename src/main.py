@@ -45,14 +45,13 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     # File-backed pool overrides
     ap.add_argument("--pool-file", dest="pool_file", help="Override PROXXY_POOL_FILE (default ./proxies.txt)")
     ap.add_argument("--pool-debounce-ms", dest="pool_debounce_ms", type=int, help="Override PROXXY_POOL_DEBOUNCE_MS (default 150)")
-    ap.add_argument("--pool-ttl-seconds", dest="pool_ttl_seconds", type=int, help="Override PROXXY_POOL_TTL_SECONDS (default 900)")
+    # TTL removed; pool is tightened by active rechecks only
     ap.add_argument("--pool-prune-interval-seconds", dest="pool_prune_interval_seconds", type=int, help="Override PROXXY_POOL_PRUNE_INTERVAL_SECONDS (default 30)")
     # Pool recheck flags removed to simplify
     
     ap.add_argument("--min-upstreams", "--min-proxies", dest="min_upstreams", type=int, help="Override PROXXY_MIN_UPSTREAMS (minimum upstream proxies required before starting server)")
     
-    # Optional convenience flags
-    ap.add_argument("--scraper-log-level", dest="scraper_log_level", help="Set PROXXY_SCRAPER_LOG_LEVEL for Scrapy logs")
+    # Optional convenience flags (none currently)
     return ap.parse_args(argv)
 
 
@@ -71,12 +70,11 @@ def main() -> int:
         # File-backed pool
         "pool_file": "PROXXY_POOL_FILE",
         "pool_debounce_ms": "PROXXY_POOL_DEBOUNCE_MS",
-        "pool_ttl_seconds": "PROXXY_POOL_TTL_SECONDS",
+    # ttl removed
         "pool_prune_interval_seconds": "PROXXY_POOL_PRUNE_INTERVAL_SECONDS",
         # Pool recheck flags removed
         "min_upstreams": "PROXXY_MIN_UPSTREAMS",
-        # Pass-through for dependent components
-        "scraper_log_level": "PROXXY_SCRAPER_LOG_LEVEL",
+    # Pass-through for dependent components (none currently)
     }
     for attr, env_key in cli_to_env.items():
         if hasattr(args, attr) and getattr(args, attr) is not None:
@@ -87,7 +85,6 @@ def main() -> int:
     # - Quicker dial timeout to fail fast and move to next upstream
     os.environ.setdefault("PROXXY_PROXY_UPSTREAM_RETRIES", "6")   # default was 2
     os.environ.setdefault("PROXXY_PROXY_DIAL_TIMEOUT", "1.8")     # seconds (fail fast; try more upstreams)
-    os.environ.setdefault("PROXXY_PROXY_UPSTREAM_FAILURE_TTL", "60")  # seconds; backoff on failing upstreams
     os.environ.setdefault("PROXXY_PROXY_UPSTREAM_FANOUT", "3")        # try up to 3 upstreams in parallel per batch
 
 
@@ -109,7 +106,7 @@ def main() -> int:
 
     # Log config summary for at-a-glance visibility
     logger.info(
-        "config: output_dir='%s' validate_url='%s' workers=%d timeout=%.1fs proxy=%s:%d pool_file='%s' ttl=%ss prune_interval=%ss status_interval=%ss",
+        "config: output_dir='%s' validate_url='%s' workers=%d timeout=%.1fs proxy=%s:%d pool_file='%s' prune_interval=%ss status_interval=%ss",
         cfg.output_dir,
         cfg.validation_url,
         cfg.validator_workers,
@@ -117,7 +114,6 @@ def main() -> int:
         cfg.proxy_host,
         cfg.proxy_port,
         cfg.pool_file_path,
-        getattr(cfg, "pool_ttl_seconds", 900),
         getattr(cfg, "pool_prune_interval_seconds", 30),
         getattr(cfg, "status_interval", 5),
     )
@@ -138,7 +134,7 @@ def main() -> int:
     ticker_interval = float(getattr(cfg, "status_interval", 5))
     ticker_t = threading.Thread(target=status_ticker, name="status-ticker", args=(health, stop_thread, ticker_interval), daemon=True)
 
-    # Start in-process PoolManager (TTL prune + optional recheck) and ingest thread
+    # Start in-process PoolManager (no TTL; active recheck only) and ingest thread
     pool_mgr = None
     pool_q = mp.Queue()
     try:
@@ -146,14 +142,21 @@ def main() -> int:
             PoolManagerConfig(
                 file_path=cfg.pool_file_path,
                 debounce_ms=cfg.pool_debounce_ms,
-                ttl_seconds=getattr(cfg, "pool_ttl_seconds", 900),
-                prune_interval_seconds=getattr(cfg, "pool_prune_interval_seconds", 30),
+                prune_interval_seconds=5,  # keep small in case future non-TTL housekeeping needed
                 health_check_url=cfg.validation_url,
-                # Softer recheck: higher tolerance and smaller per-interval sample
-                recheck_timeout=2.5,
-                recheck_per_interval=300,
-                recheck_workers=32,
+                # Centralized recheck config (no env knobs)
                 enable_recheck=True,
+                recheck_interval_seconds=5,   # more frequent rechecks
+                recheck_order="newest",
+                recheck_per_interval=1000,    # scan larger slices each interval
+                recheck_workers=64,
+                recheck_timeout=2.5,
+                recheck_connect_timeout=1.8,
+                recheck_min_bytes=1024,
+                recheck_read_seconds=2.5,
+                recheck_ttfb_seconds=2.0,
+                recheck_chunk_size=8192,
+                recheck_strikes_threshold=1,   # remove on first failed recheck
             )
         )
         pool_mgr.start()
@@ -181,33 +184,7 @@ def main() -> int:
         ticker_t.start()
     producer.start()
 
-    # Wait for enough upstream proxies before starting proxy (gate launch)
-    min_required = max(0, int(getattr(cfg, "min_upstreams", 1)))
-    if min_required > 0:
-        logger.info("proxy: waiting for at least %d upstream proxies before start...", min_required)
-    last_log = time.monotonic()
-    while not stop_thread.is_set():
-        if min_required <= 0:
-            break
-        try:
-            ready = int(pool_mgr.size() if pool_mgr is not None else 0)
-        except Exception:
-            ready = 0
-        if ready >= min_required:
-            border = "=" * 72
-            try:
-                logger.info(border)
-                logger.info("= PROXY READY: upstreams >= %d (have %d) =", min_required, ready)
-                logger.info("= Starting tunnel on %s:%d =", cfg.proxy_host, cfg.proxy_port)
-                logger.info(border)
-            except Exception:
-                pass
-            break
-        if (time.monotonic() - last_log) >= 2.0:
-            logger.info("proxy: upstreams %d/%d ready", ready, min_required)
-            last_log = time.monotonic()
-        time.sleep(0.5)
-
+    # Start proxy thread; orchestrator handles upstream gating internally
     if not stop_thread.is_set():
         proxy_t.start()
 
